@@ -66,6 +66,21 @@ $git = 'D:\tools\git\cmd\git.exe'   # 便携版 git
 
 配好远端后，发版脚本会自动推送分支和 tag；没有远端时脚本只发到本地，并提示怎么补推。
 
+本仓库远端：`git@github.com:xuanxiawa/-.git`（SSH，不是 HTTPS）。
+
+这台机器上 `github.com:443` 的 TLS 会被打断，所以 `~/.ssh/config` 里把 `github.com` 指到了
+`ssh.github.com:443`：
+
+```
+Host github.com
+    HostName ssh.github.com
+    Port 443
+    User git
+```
+
+这样 `git push` 会自动走 443，命令不用改。首次配置需要把 `~/.ssh/id_ed25519.pub` 加到
+GitHub 的 SSH keys 里。
+
 发布页（网页端）的操作：
 
 - 标题填 `v0.1.2`，选刚打的那个 tag
