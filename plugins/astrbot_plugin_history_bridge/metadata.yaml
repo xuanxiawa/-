@@ -1,0 +1,7 @@
+name: astrbot_plugin_history_bridge
+display_name: 对话记账桥
+desc: 把她自己发出的每条消息（命令回复、主动消息）都记进对话历史
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"
