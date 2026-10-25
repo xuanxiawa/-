@@ -315,6 +315,27 @@ class WatchAlong(Star):
                 _log("loop error")
                 logger.debug("watchalong loop error", exc_info=True)
 
+    async def _remember_outgoing(self, umo: str, text: str) -> None:
+        """主动说的话不经过 LLM 管线，默认不进 history，这里补上。"""
+        try:
+            cm = self.context.conversation_manager
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                return
+            conv = await cm.get_conversation(umo, cid)
+            if not conv:
+                return
+            history = json.loads(conv.history or "[]")
+            if not isinstance(history, list):
+                return
+            if history and history[-1].get("role") == "assistant" and history[-1].get("content") == text:
+                return
+            history.append({"role": "assistant", "content": text})
+            await cm.update_conversation(umo, cid, history=history)
+            _log("已把主动消息写入对话历史")
+        except Exception:  # noqa: BLE001
+            logger.debug("watchalong: 写对话历史失败", exc_info=True)
+
     async def _comment(self, title: str, scene: str, detail: str = ""):
         try:
             with io.open(_UMO, encoding="utf-8") as fh:
@@ -352,6 +373,7 @@ class WatchAlong(Star):
                 session=umo, message_chain=MessageChain([Plain(text[:200])])
             )
             _log(f"comment sent: {text[:60]}")
+            await self._remember_outgoing(umo, text[:200])
             try:
                 import json as _json, time as _time
                 with io.open(r"D:\AstrBot\recent-outgoing.jsonl", "a", encoding="utf-8") as fh:

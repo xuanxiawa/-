@@ -603,6 +603,36 @@ class Heart(Star):
             except Exception:  # noqa: BLE001
                 logger.debug("heart wake error", exc_info=True)
 
+    async def _remember_outgoing(self, umo: str, text: str) -> None:
+        """把自己主动发出的话写进对话历史。
+
+        主动消息走的是 context.send_message，不经过 LLM 管线，
+        所以默认不会进 history —— 下一轮她就会「不认账」。
+        """
+        try:
+            with io.open(r"D:\AstrBot\recent-outgoing.jsonl", "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"ts": time.time(), "text": text}, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            cm = self.context.conversation_manager
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                return
+            conv = await cm.get_conversation(umo, cid)
+            if not conv:
+                return
+            history = json.loads(conv.history or "[]")
+            if not isinstance(history, list):
+                return
+            if history and history[-1].get("role") == "assistant" and history[-1].get("content") == text:
+                return
+            history.append({"role": "assistant", "content": text})
+            await cm.update_conversation(umo, cid, history=history)
+            logger.debug("heart: 主动消息已写入对话历史")
+        except Exception:  # noqa: BLE001
+            logger.debug("heart: 写对话历史失败", exc_info=True)
+
     async def _wake_once(self, s: dict) -> None:
         try:
             with io.open(_UMO, encoding="utf-8") as fh:
@@ -642,6 +672,7 @@ class Heart(Star):
             if not text or len(text) > 60:
                 return
             await self.context.send_message(session=umo, message_chain=MessageChain([Plain(text)]))
+            await self._remember_outgoing(umo, text)
             if kind == "约定" and pending:
                 s["pending"] = pending[:-1]
                 _save(_STATE, s)

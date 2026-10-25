@@ -368,6 +368,27 @@ class BrowserBili(Star):
             except Exception:  # noqa: BLE001
                 logger.exception("browser_bili: 自主浏览出错")
 
+    async def _remember_outgoing(self, umo: str, text: str) -> None:
+        """主动说的话不经过 LLM 管线，默认不进 history，这里补上。"""
+        try:
+            cm = self.context.conversation_manager
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                return
+            conv = await cm.get_conversation(umo, cid)
+            if not conv:
+                return
+            history = json.loads(conv.history or "[]")
+            if not isinstance(history, list):
+                return
+            if history and history[-1].get("role") == "assistant" and history[-1].get("content") == text:
+                return
+            history.append({"role": "assistant", "content": text})
+            await cm.update_conversation(umo, cid, history=history)
+            logger.debug("browser_bili: 已把主动消息写入对话历史")
+        except Exception:  # noqa: BLE001
+            logger.debug("browser_bili: 写对话历史失败", exc_info=True)
+
     async def _notify(self, result: dict):
         """刷完视频，用她自己的口吻说一句（不再贴原始描述）。"""
         try:
@@ -409,6 +430,7 @@ class BrowserBili(Star):
                     fh.write(json.dumps({"ts": time.time(), "text": text[:200]}, ensure_ascii=False) + "\n")
             except Exception:
                 pass
+            await self._remember_outgoing(umo, text[:200])
         except Exception:  # noqa: BLE001
             logger.debug("browser_bili: 主动通知失败", exc_info=True)
 
