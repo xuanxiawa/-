@@ -9,6 +9,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# 控制台统一用 UTF-8，避免中文提交信息变乱码
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    [Console]::InputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch { }
+
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
