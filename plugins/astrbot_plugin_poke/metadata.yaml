@@ -1,0 +1,7 @@
+name: astrbot_plugin_poke
+display_name: 戳一戳反应
+desc: 被戳一戳会戳回去并说一句，顺手记进临时记忆
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

@@ -1,0 +1,7 @@
+name: astrbot_plugin_toast
+display_name: 桌面气泡
+desc: 把 QQ 私聊里大肥鱼的回复弹成 Windows 托盘气泡
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

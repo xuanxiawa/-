@@ -1,0 +1,7 @@
+name: astrbot_plugin_watchdog
+display_name: 看门狗
+desc: QQ 掉线时弹二维码提醒；NapCat 进程挂了自动拉起
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

@@ -1,0 +1,35 @@
+# ---- 运行环境（体积大，不入库）----
+astrbot-env/
+python/
+ffmpeg/
+whisper-model/
+gpt-sovits/
+已停用/
+.venv/
+venv/
+
+# ---- 第三方插件（各自有仓库，不纳入）----
+plugins/astrbot_plugin_group_chat_plus/
+plugins/astrbot_plugin_meme_manager/
+
+# ---- Python 产物 ----
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# ---- 运行时数据与日志 ----
+data/
+*.log
+*.pid
+*.tmp
+*.bak
+*.bak-*
+
+# ---- 系统与编辑器 ----
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

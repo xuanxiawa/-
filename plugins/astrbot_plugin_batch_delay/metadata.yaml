@@ -1,0 +1,7 @@
+name: astrbot_plugin_batch_delay
+display_name: 私聊缓冲
+desc: 连发的多条消息合并成一轮再回（利用 AstrBot 的 follow-up 合并）
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

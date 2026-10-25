@@ -1,0 +1,7 @@
+name: astrbot_plugin_bili_lookup
+display_name: B站链接解析
+desc: 让 AI 能读取 B 站视频的标题、简介、UP 主、热评和弹幕，用来跟人聊视频内容
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

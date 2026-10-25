@@ -1,0 +1,7 @@
+name: astrbot_plugin_lyrics
+display_name: 歌词
+desc: 搜歌和取歌词
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

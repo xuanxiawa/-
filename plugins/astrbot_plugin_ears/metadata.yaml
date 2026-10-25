@@ -1,0 +1,7 @@
+name: astrbot_plugin_ears
+display_name: 耳朵
+desc: 录一段电脑正在播放的声音，识别歌曲（Shazam）或转写成文字，让 AI 知道你在听什么
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

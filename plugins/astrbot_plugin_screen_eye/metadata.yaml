@@ -1,0 +1,7 @@
+name: astrbot_plugin_screen_eye
+display_name: 屏幕眼睛
+desc: 让 AI 截取用户当前屏幕并用视觉模型看懂，可以在聊天里问它“你看我屏幕在干嘛”
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

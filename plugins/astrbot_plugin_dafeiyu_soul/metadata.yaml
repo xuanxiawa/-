@@ -1,0 +1,7 @@
+name: astrbot_plugin_dafeiyu_soul
+display_name: 大肥鱼的心智
+desc: 情绪状态（好奇/无聊/精力/心情）+ 长期记忆 + 梗库：会自己学梗、会接梗
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

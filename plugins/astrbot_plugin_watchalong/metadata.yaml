@@ -1,0 +1,7 @@
+name: astrbot_plugin_watchalong
+display_name: 陪看B站
+desc: 主人看 B 站（客户端或网页）时她也跟着看，并主动搭话
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

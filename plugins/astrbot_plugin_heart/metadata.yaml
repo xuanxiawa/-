@@ -1,0 +1,7 @@
+name: astrbot_plugin_heart
+display_name: 大肥鱼的心
+desc: 好感度 + 心情 + 三级日记（会遗忘）+ 主动找你（约定/想你/随性）+ 每日04:00复盘
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

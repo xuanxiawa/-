@@ -1,0 +1,7 @@
+name: astrbot_plugin_stickers
+display_name: 她自己的表情包
+desc: 把主人发的图收进自己的表情包库，并能自己发出来
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

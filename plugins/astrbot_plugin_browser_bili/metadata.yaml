@@ -1,0 +1,7 @@
+name: astrbot_plugin_browser_bili
+display_name: 浏览器刷B站
+desc: 让机器人开一个真实浏览器，搜 B 站、点开视频、滚动页面、截屏后用视觉模型看懂
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

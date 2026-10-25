@@ -1,0 +1,7 @@
+name: astrbot_plugin_bili_client
+display_name: 客户端刷B站
+desc: 用桌面版哔哩哔哩客户端刷视频（PrintWindow 截图 + 模拟点击搜索）
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

@@ -1,0 +1,7 @@
+name: astrbot_plugin_meme_render
+display_name: 模板表情
+desc: QQ 里现做大肥鱼模板表情（举牌/想/上联/下联/葱卷），底层调 DSH 插件 CLI
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

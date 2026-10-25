@@ -1,0 +1,7 @@
+name: astrbot_plugin_qq_more
+display_name: 更多QQ权限
+desc: 发空间说说 / 在线状态 / 戳一戳 / 群头衔
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

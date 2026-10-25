@@ -1,0 +1,7 @@
+name: astrbot_plugin_qq_avatar
+display_name: 自己换头像
+desc: 让大肥鱼自己换 QQ 头像 / 昵称 / 个性签名（NapCat 扩展接口）
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

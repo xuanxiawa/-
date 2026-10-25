@@ -1,0 +1,7 @@
+name: astrbot_plugin_terraria
+display_name: 泰拉瑞亚
+desc: 让 AI 看泰拉瑞亚画面并按键（只在前台操作）
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"
