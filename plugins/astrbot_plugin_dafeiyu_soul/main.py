@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import random
 import re
@@ -55,11 +56,23 @@ _QUESTION_HINTS = ("?", "？", "吗", "呢", "为什么", "咋", "怎么", "什�
 _HAPPY_HINTS = ("哈哈", "笑死", "好耶", "nice", "牛", "6", "爽", "开心")
 _SAD_HINTS = ("累", "难受", "烦", "哭了", "无语", "烦死", "困")
 
+# 高频虚词二元组：做「证据」匹配时要滤掉，否则「什么」「今天」会把什么都捞上来
+_STOP_GRAMS = frozenset(
+    """
+    今天 明天 昨天 现在 什么 怎么 可以 这个 那个 我们 你们 他们 她们 自己 一个 没有
+    就是 还是 知道 觉得 时候 已经 因为 所以 但是 如果 然后 这样 那样 一下 有点 真的
+    不是 记得 还记 得我 得你 的吗 了吗 是不 好像 应该 可能 一直 其实 比较 非常 特别
+    东西 事情 地方 问题 感觉 起来 出来 回来 过来 是的 了你 了吧 我觉 我感 有没 就好
+    """.split()
+)
+
 _LEARN_PROMPT = """你是一个中文网络用语分析器。根据下面这段聊天，抽取：
 1) 出现的网络梗/黑话/流行语，给出简短含义（没有就给空数组）；
 2) 关于用户、值得长期记住的事实（称呼、作息、喜好、正在做的事；没有就给空数组）。
+   level 怎么填：称呼、约定、长期不变的喜好 → 非常重要；近期发生的事、临时状态 → 普通；
+   介于两者之间（习惯、偏好、正在做的项目）→ 重要。
 只输出 JSON，不要解释：
-{"memes":[{"term":"","meaning":"","example":""}],"notes":["..."]}
+{"memes":[{"term":"","meaning":"","example":""}],"notes":[{"text":"","level":"普通"}]}
 """
 
 
@@ -258,23 +271,30 @@ class Soul:
 
 
     # ---------- 笔记的半衰期记忆 ----------
+    # 鲜活度按重要度分档：普通 30 天一衰，重要 90 天，非常重要基本不淡
+    _NOTE_HALF_LIFE = {"普通": 30.0, "重要": 90.0, "非常重要": 3650.0}
     _NOTE_HALF_LIFE_DAYS = 30.0
 
+    def _note_hl(self, n: dict) -> float:
+        lv = str(n.get("level") or "普通")
+        return float(self._NOTE_HALF_LIFE.get(lv, self._NOTE_HALF_LIFE_DAYS))
+
     def _note_weight(self, n: dict) -> float:
-        import time as _t
-        now = _t.time()
+        now = time.time()
         base = float(n.get("w") or 1.0)
         last = float(n.get("last_hit") or n.get("ts") or now)
         age_days = max(0.0, (now - last) / 86400.0)
-        return base * (0.5 ** (age_days / self._NOTE_HALF_LIFE_DAYS))
+        return base * (0.5 ** (age_days / self._note_hl(n)))
 
     def decay_notes(self) -> None:
         """把太轻的笔记删掉；每次请求只跑一次，成本可忽略。"""
-        import time as _t
-        now = _t.time()
+        now = time.time()
         before = len(self.notes)
         keep = []
         for n in self.notes:
+            if str(n.get("level") or "普通") == "非常重要":
+                keep.append(n)
+                continue
             w = self._note_weight(n)
             ts = float(n.get("ts") or now)
             if w < 0.12 and (now - ts) > 90 * 86400:
@@ -286,16 +306,14 @@ class Soul:
 
     def boost_notes(self, text: str) -> None:
         """他说的话里出现了笔记里的词，就把那条弹回来。"""
-        import time as _t
         if not text or not self.notes:
             return
-        now = _t.time()
+        now = time.time()
         changed = False
         for n in self.notes:
             nt = str(n.get("text") or "")
             if not nt:
                 continue
-            # 取笔记里 2 字以上的片段做匹配
             chars = [c for c in nt if "\u4e00" <= c <= "\u9fff"]
             if len(chars) < 3:
                 continue
@@ -306,6 +324,83 @@ class Soul:
                 changed = True
         if changed:
             self.save()
+
+    @staticmethod
+    def _grams(text: str) -> set[str]:
+        """切中文二元组 + 英数词，做「证据」匹配，不依赖分词库。"""
+        out: set[str] = set()
+        t = str(text or "").lower()
+        cjk = "".join(c if "\u4e00" <= c <= "\u9fff" else " " for c in t)
+        for seg in cjk.split():
+            for i in range(len(seg) - 1):
+                out.add(seg[i:i + 2])
+        for w in re.findall(r"[a-z0-9_]{2,}", t):
+            out.add(w)
+        out -= _STOP_GRAMS
+        return out
+
+    def _idf(self) -> tuple[dict[str, float], dict[str, int], int]:
+        n_docs = len(self.notes)
+        df: dict[str, int] = {}
+        for n in self.notes:
+            for g in self._grams(n.get("text") or ""):
+                df[g] = df.get(g, 0) + 1
+        idf = {
+            g: math.log((n_docs + 1.0) / (c + 1.0)) + 1.0 for g, c in df.items()
+        }
+        return idf, df, n_docs
+
+    def recall(self, query: str, k: int = 6, min_evidence: float = 1.6) -> list[dict]:
+        """按他刚说的话挑记忆：命中词越特别、越新、越重要，越容易被想起来。"""
+        if not query or not self.notes:
+            return []
+        qg = self._grams(query)
+        if not qg:
+            return []
+        idf, df, n_docs = self._idf()
+        common = max(3, int(n_docs * 0.3))  # 太常见的词不算证据
+        now = time.time()
+        scored = []
+        for n in self.notes:
+            ng = self._grams(n.get("text") or "")
+            matched = [g for g in (qg & ng) if df.get(g, 0) <= common]
+            if not matched:
+                continue
+            evidence = sum(idf.get(g, 1.0) for g in matched)
+            if evidence < min_evidence:
+                continue
+            age = max(0.0, (now - float(n.get("ts") or now)) / 86400.0)
+            fresh = 0.5 ** (age / self._note_hl(n))
+            imp = min(2.0, float(n.get("w") or 1.0)) / 2.0
+            scored.append((evidence * (0.6 * fresh + 0.4 * imp), n))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        picked = [n for _, n in scored[:k]]
+        self._last_recall = [(str(n.get("text") or "")[:30], round(s, 2)) for s, n in scored[:k]]
+
+        # 长期事实（非常重要）没被挑到也带上，最多两条
+        durable = [
+            n for n in self.notes
+            if str(n.get("level") or "") == "非常重要" and n not in picked
+        ]
+        durable.sort(key=self._note_weight, reverse=True)
+        picked.extend(durable[:2])
+
+        # 一条都没命中就退回最鲜活的几条，别让她一片空白
+        if not picked:
+            self._last_recall = []
+            picked = sorted(self.notes, key=self._note_weight, reverse=True)[:3]
+
+        for n in picked:
+            n["last_hit"] = now
+            n["w"] = min(2.0, float(n.get("w") or 1.0) + 0.15)
+        return picked[: max(k, 3)]
+
+    @staticmethod
+    def _fmt_note(n: dict) -> str:
+        ts = float(n.get("ts") or 0)
+        day = time.strftime("%m-%d", time.localtime(ts)) if ts else ""
+        txt = str(n.get("text") or "").strip()
+        return f"{day} {txt}".strip()
 
     def weighted_notes(self, k: int = 6) -> list[str]:
         scored = sorted(self.notes, key=self._note_weight, reverse=True)
@@ -318,7 +413,7 @@ class Soul:
                 break
         return out
 
-    def prompt_block(self) -> str:
+    def prompt_block(self, query: str = "") -> str:
         s = self.state
         lines = [
             "【你的当前状态 · 只影响语气，不要说出这些数字或属性】",
@@ -351,9 +446,19 @@ class Soul:
 
         if self.notes:
             self.decay_notes()
-            recent_notes = self.weighted_notes(6)
-            if recent_notes:
-                lines.append("【你记得的事】" + "；".join(recent_notes))
+            picked = self.recall(query, 6) if query else []
+            if picked:
+                lines.append(
+                    "【你记得的事 · 按他刚说的话挑的】"
+                    + "；".join(self._fmt_note(n) for n in picked)
+                )
+                lines.append(
+                    "（没挑上的不是忘了，只是这次没想起来。自然地用，别报「我记得…」的清单。）"
+                )
+            else:
+                recent_notes = self.weighted_notes(4)
+                if recent_notes:
+                    lines.append("【你记得的事】" + "；".join(recent_notes))
         return "\n".join(lines)
 
 
@@ -437,7 +542,7 @@ class DafeiyuSoul(Star):
                 self.soul.on_message(text)
                 self.soul.save()
             self.soul.apply_external_delta()
-            block = self.soul.prompt_block()
+            block = self.soul.prompt_block(text)
             req.system_prompt = (req.system_prompt or "") + "\n\n" + block
         except Exception:  # noqa: BLE001
             logger.warning("注入心智状态失败", exc_info=True)
@@ -489,12 +594,20 @@ class DafeiyuSoul(Star):
                 )
                 changed = True
             for note in result.get("notes") or []:
-                note = str(note).strip()
-                if not note or len(note) > 120:
+                if isinstance(note, dict):
+                    note_text = str(note.get("text") or "").strip()
+                    level = str(note.get("level") or "普通").strip()
+                else:
+                    note_text, level = str(note).strip(), "普通"
+                if level not in ("普通", "重要", "非常重要"):
+                    level = "普通"
+                if not note_text or len(note_text) > 120:
                     continue
-                if any(n.get("text") == note for n in self.soul.notes):
+                if any(n.get("text") == note_text for n in self.soul.notes):
                     continue
-                self.soul.notes.append({"ts": time.time(), "kind": "note", "text": note})
+                self.soul.notes.append(
+                    {"ts": time.time(), "kind": "note", "text": note_text, "level": level}
+                )
                 changed = True
             if len(self.soul.memes) > 200:
                 self.soul.memes = self.soul.memes[-200:]
@@ -532,16 +645,24 @@ class DafeiyuSoul(Star):
         return f"学会了，「{term}」是吧。"
 
     @llm_tool(name="remember_note")
-    async def remember_note(self, event: AstrMessageEvent, text: str) -> str:
+    async def remember_note(
+        self, event: AstrMessageEvent, text: str, level: str = "普通"
+    ) -> str:
         """记下关于用户的一件小事，以后聊天可以用上。
 
         Args:
             text(string): 要记住的事实，一句话，比如「他周三下午有课」
+            level(string): 重要度，普通 / 重要 / 非常重要（约定、喜好、长期不变的事实用「非常重要」）
         """
         text = (text or "").strip()
         if not text or len(text) > 120:
             return "这句太长或者空了，记不住。"
-        self.soul.notes.append({"ts": time.time(), "kind": "note", "text": text})
+        level = (level or "普通").strip()
+        if level not in ("普通", "重要", "非常重要"):
+            level = "普通"
+        self.soul.notes.append(
+            {"ts": time.time(), "kind": "note", "text": text, "level": level}
+        )
         self.soul.notes = self.soul.notes[-200:]
         self.soul.save()
         return "记住了。"
@@ -563,12 +684,18 @@ class DafeiyuSoul(Star):
 
     @filter.command("笔记")
     async def notes_cmd(self, event: AstrMessageEvent):
-        """看她记了关于你的哪些事。"""
+        """看她记了关于你的哪些事，以及上一次她想起了哪几条。"""
         notes = [n.get("text", "") for n in self.soul.notes[-10:] if n.get("text")]
         if not notes:
             yield event.plain_result("还没记什么。")
             return
-        yield event.plain_result("关于你：\n" + "\n".join(f"- {x[:40]}" for x in notes))
+        out = "关于你：\n" + "\n".join(f"- {x[:40]}" for x in notes)
+        last = getattr(self.soul, "_last_recall", None)
+        if last:
+            out += "\n\n上一次她想起的是：\n" + "\n".join(
+                f"- {t}（{s}）" for t, s in last
+            )
+        yield event.plain_result(out)
 
     @filter.command("忘掉")
     async def forget_cmd(self, event: AstrMessageEvent, term: str = ""):
