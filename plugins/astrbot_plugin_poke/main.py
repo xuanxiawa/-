@@ -62,6 +62,25 @@ class PokeBack(Star):
             pass
         return False
 
+    async def _remember_exchange(self, umo: str, bot_line: str) -> None:
+        """戳一戳的回复不经过 LLM 管线，不补进历史的话，下一句她就接不上了。"""
+        try:
+            cm = self.context.conversation_manager
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                return
+            conv = await cm.get_conversation(umo, cid)
+            if not conv:
+                return
+            history = json.loads(conv.history or "[]")
+            if not isinstance(history, list):
+                return
+            history.append({"role": "user", "content": "（戳了戳你）"})
+            history.append({"role": "assistant", "content": bot_line})
+            await cm.update_conversation(umo, cid, history=history)
+        except Exception:  # noqa: BLE001
+            logger.debug("poke: 写对话历史失败", exc_info=True)
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_poke(self, event: AstrMessageEvent):
         if not self._is_poke(event):
@@ -134,5 +153,6 @@ class PokeBack(Star):
             except Exception:  # noqa: BLE001
                 logger.debug("poke back failed", exc_info=True)
 
+        await self._remember_exchange(event.unified_msg_origin, line)
         yield event.plain_result(line)
         event.stop_event()
