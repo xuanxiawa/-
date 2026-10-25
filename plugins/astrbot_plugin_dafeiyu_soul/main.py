@@ -139,7 +139,18 @@ class Soul:
         self.state["boredom"] = _clamp(
             self.state["boredom"] + hours * 0.22
         )  # 越久没人说话越无聊
-        self.state["energy"] = _clamp(self.state["energy"] - hours * 0.06)
+        # 精力：睡着（夜里且安静）恢复最快，白天闲着慢，正聊着不回
+        hour = time.localtime(now).tm_hour
+        idle_h = (now - float(self.state.get("last_message_ts") or 0)) / 3600.0
+        night = hour < 7 or hour >= 23
+        if night and idle_h >= 0.5:
+            rate = 0.9
+        elif idle_h >= 1.0:
+            rate = 0.10
+        else:
+            rate = 0.0
+        if rate:
+            self.state["energy"] = _clamp(self.state["energy"] + hours * rate)
         self.state["curiosity"] = _clamp(self.state["curiosity"] - hours * 0.10)
         self.state["mood"] += (0.5 - self.state["mood"]) * min(1.0, hours * 0.15)
         self.state["mood"] = _clamp(self.state["mood"])
@@ -715,10 +726,21 @@ class DafeiyuSoul(Star):
     @filter.command("心情")
     async def mood_command(self, event: AstrMessageEvent):
         """看看它现在的心情状态。"""
+        self.soul.refresh_state()
+        self.soul.decay()
+        self.soul.save()
         s = self.soul.state
+        label = ""
+        try:
+            hp = Path(r"D:\AstrBot\bot\data\plugin_data\heart\state.json")
+            if hp.exists():
+                label = json.loads(hp.read_text("utf-8")).get("mood") or ""
+        except Exception:  # noqa: BLE001
+            label = ""
+        mood_text = f"{label}（{s['mood']:.2f}）" if label else f"{s['mood']:.2f}"
         text = (
             f"好奇 {s['curiosity']:.2f}｜无聊 {s['boredom']:.2f}｜"
-            f"精力 {s['energy']:.2f}｜心情 {s['mood']:.2f}\n"
+            f"精力 {s['energy']:.2f}｜心情 {mood_text}\n"
             f"聊过 {s.get('msg_count', 0)} 句，攒了 {len(self.soul.memes)} 个梗、"
             f"{len(self.soul.notes)} 条记忆"
         )

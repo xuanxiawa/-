@@ -34,10 +34,28 @@ _MD = os.path.join(_DATA, "日记.md")
 _FAV_MD = os.path.join(_DATA, "好感度.md")
 _DB = r"D:\AstrBot\bot\data\data_v4.db"
 
-MOODS = ["开心", "平静", "闷闷的", "有点难过", "生气"]
+MOODS = ["兴奋", "开心", "平静", "无聊", "闷闷的", "有点难过", "委屈", "生气", "困", "黏人"]
 SAD_WORDS = ["累", "难受", "自卑", "没用", "废", "想哭", "烦", "压力", "焦虑", "难过", "emo", "不想活", "撑不住"]
 HAPPY_WORDS = ["开心", "哈哈", "好耶", "笑死", "喜欢你", "可爱", "厉害", "谢谢", "舒服", "好棒"]
 ANGRY_WORDS = ["滚", "闭嘴", "烦人", "别烦", "去死", "傻逼", "恶心"]
+EXCITED_WORDS = ["太棒", "中奖", "赢了", "牛啊", "牛逼", "啊啊啊", "太好了", "nb", "绝了"]
+BORED_WORDS = ["无聊", "没意思", "随便", "都行", "不知道干嘛", "好闲", "没事干"]
+TIRED_WORDS = ["困", "睡了", "晚安", "熬夜", "不睡", "好累", "睁不开"]
+CLINGY_WORDS = ["想你了", "在吗", "陪我", "抱抱", "想你"]
+
+# 每种心情给模型的表演提示（只影响语气，不报状态值）
+MOOD_HINTS = {
+    "兴奋": "你现在很兴奋：句子短、感叹多、爱连说两三句",
+    "开心": "你现在心情不错：语气轻快，愿意接话",
+    "平静": "你现在挺平静：正常聊，不冷不热",
+    "无聊": "你有点无聊：回得短、有点敷衍，但对方说点有意思的会立刻来劲",
+    "闷闷的": "你有点闷：话少，情绪不高，但不用刻意演",
+    "有点难过": "你不太好受：语气软下来，句子短，别撒娇",
+    "委屈": "你有点委屈：说话带点小情绪，但不闹、不指责",
+    "生气": "你在生气：话短、语气冲，但别真的骂人",
+    "困": "你困了：迷糊、句子很短、会想睡觉",
+    "黏人": "你有点想他：会主动扯话题、舍不得结束对话",
+}
 
 LEVEL_EXPIRE_DAYS = {"临时": 0.5, "普通": 7, "重要": 30, "非常重要": None}
 
@@ -63,6 +81,14 @@ def _save(path, data):
         logger.debug("heart save failed", exc_info=True)
 
 
+def _num(v, default: float) -> float:
+    """取数值，0 也要当 0 用（`x or default` 会把 0 吞掉）。"""
+    try:
+        return float(v) if v is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _default_state() -> dict:
     return {
         "favor": 10.0,
@@ -76,6 +102,7 @@ def _default_state() -> dict:
         "last_user_ts": 0.0,
         "last_bot_ts": 0.0,
         "last_wake_ts": 0.0,
+        "last_energy_ts": 0.0,
         "last_review": "",
         "pending": [],
     }
@@ -167,26 +194,78 @@ def _write_fav_file(s: dict) -> None:
         pass
 
 
+def _mood_label(s: dict, low: str = "") -> str:
+    """把分数 + 精力 + 多久没说话，合成一个具体心情。"""
+    score = float(s.get("mood_score") or 0.6)
+    energy = _num(s.get("energy"), 0.75)
+    now = time.time()
+    idle_h = (now - float(s.get("last_user_ts") or now)) / 3600.0
+    if any(w in low for w in ANGRY_WORDS) or score < 0.22:
+        return "生气"
+    if energy < 0.22:
+        return "困"
+    if idle_h >= 20 and score >= 0.55:
+        return "黏人"
+    if score >= 0.82:
+        return "兴奋"
+    if score >= 0.68:
+        return "开心"
+    if score >= 0.52:
+        return "平静"
+    if score >= 0.42:
+        return "无聊"
+    if score >= 0.34:
+        return "闷闷的"
+    if score >= 0.26:
+        return "有点难过"
+    return "委屈"
+
+
+def _recover_energy(s: dict) -> dict:
+    """闲着会回血：睡觉时段快，白天慢；聊得越勤越不回。"""
+    now = time.time()
+    last = float(s.get("last_energy_ts") or 0)
+    if not last:
+        s["last_energy_ts"] = now
+        return s
+    hours = max(0.0, min(24.0, (now - last) / 3600.0))
+    if hours < 0.2:
+        return s
+    idle_h = (now - float(s.get("last_user_ts") or now)) / 3600.0
+    hour = datetime.now().hour
+    night = hour < 7 or hour >= 23
+    if night and idle_h >= 0.5:
+        rate = 0.9   # 睡觉：一小时回 9 成
+    elif idle_h >= 1.0:
+        rate = 0.10  # 白天闲着：慢一点
+    else:
+        rate = 0.0   # 聊得正热，不回血
+    if rate:
+        s["energy"] = max(0.05, min(1.0, _num(s.get("energy"), 0.75) + hours * rate))
+        s["last_energy_ts"] = now
+    return s
+
+
 def _update_mood(s: dict, text: str) -> dict:
     low = (text or "").lower()
-    sad = any(w in low for w in SAD_WORDS)
-    happy = any(w in low for w in HAPPY_WORDS)
-    angry = any(w in low for w in ANGRY_WORDS)
     score = float(s.get("mood_score") or 0.6)
-    if angry:
-        s["mood"] = "有点难过"
-        score -= 0.18
-    elif happy:
-        s["mood"] = "开心"
+    if any(w in low for w in ANGRY_WORDS):
+        score -= 0.20
+    if any(w in low for w in SAD_WORDS):
+        score -= 0.08
+    if any(w in low for w in HAPPY_WORDS):
+        score += 0.10
+    if any(w in low for w in EXCITED_WORDS):
         score += 0.12
-    elif sad:
-        s["mood"] = "闷闷的"
-        score -= 0.06
-    else:
-        score += (0.6 - score) * 0.1
-        if abs(score - 0.6) < 0.12:
-            s["mood"] = "平静"
-    s["mood_score"] = max(0.05, min(1.0, score))
+    if any(w in low for w in BORED_WORDS):
+        score -= 0.05
+    if any(w in low for w in CLINGY_WORDS):
+        score += 0.05
+    if any(w in low for w in TIRED_WORDS):
+        score -= 0.04
+    score += (0.6 - score) * 0.05  # 慢慢回落到基线
+    s["mood_score"] = max(0.02, min(1.0, score))
+    s["mood"] = _mood_label(s, low)
     return s
 
 
@@ -351,7 +430,7 @@ def _apply_heart_delta() -> None:
     try:
         s = _state()
         s["mood_score"] = max(0.05, min(1.0, float(s.get("mood_score") or 0.6) + float(d.get("mood_score") or 0)))
-        s["energy"] = max(0.05, min(1.0, float(s.get("energy") or 0.75) + float(d.get("energy") or 0)))
+        s["energy"] = max(0.05, min(1.0, _num(s.get("energy"), 0.75) + float(d.get("energy") or 0)))
         sc = float(s["mood_score"])
         s["mood"] = "开心" if sc > 0.72 else ("闷闷的" if sc < 0.45 else "平静")
         _save(_STATE, s)
@@ -405,9 +484,10 @@ class Heart(Star):
             text = event.message_str or ""
             _recent_append("他", text)
             s = _state()
+            s = _recover_energy(s)
             s["last_user_ts"] = time.time()
             s["msg_count"] = int(s.get("msg_count") or 0) + 1
-            s["energy"] = max(0.05, float(s.get("energy") or 0.75) - 0.012)
+            s["energy"] = max(0.05, _num(s.get("energy"), 0.75) - 0.012)
             s = _update_mood(s, text)
             if s["msg_count"] % 8 == 0:
                 s = _add_favor(s, 1.0)
@@ -422,7 +502,8 @@ class Heart(Star):
     async def inject(self, event: AstrMessageEvent, req):
         try:
             _apply_heart_delta()
-            s = _state()
+            s = _recover_energy(_state())
+            _save(_STATE, s)
             lv = _favor_level(s["favor"])
             diary = _fresh_diary()[-2:]
             block = [
@@ -430,7 +511,10 @@ class Heart(Star):
                 f"- 好感度 Lv.{lv}（基础印象，不影响你怎么表达喜欢）",
                 f"- 现在心情：{s['mood']}",
             ]
-            e = float(s.get("energy") or 0.75)
+            hint = MOOD_HINTS.get(str(s.get("mood") or ""))
+            if hint:
+                block.append(f"- {hint}")
+            e = _num(s.get("energy"), 0.75)
             if e < 0.35:
                 block.append("- 你有点累了，说话更短更懒（**这是可以直接说出来的**：累、困）")
             elif e > 0.85:
@@ -767,7 +851,7 @@ class Heart(Star):
         try:
             s = _state()
             mood = s.get("mood", "平静")
-            energy = float(s.get("energy") or 0.7)
+            energy = _num(s.get("energy"), 0.7)
             recent = ""
             try:
                 items = [i.get("text", "") for i in _fresh_diary()[-2:]]
@@ -882,7 +966,7 @@ class Heart(Star):
                 prompt_me = (
                     "你是大肥鱼，一只住在 QQ 里的小鲸鱼娘。用第一人称写一句「今天」的感受，20 字以内。"
                     "主语必须是你自己（我今天…/我觉得…），不要写你在陪谁、不要总结别人的事。只输出这句话。\n"
-                    f"你现在的精力 {float(st2.get('energy') or 0.7):.2f}，心情「{st2.get('mood')}」。"
+                    f"你现在的精力 {_num(st2.get('energy'), 0.7):.2f}，心情「{st2.get('mood')}」。"
                 )
                 prov2 = await self.context.get_using_provider_async()
                 if prov2:
@@ -891,7 +975,7 @@ class Heart(Star):
                     if line:
                         me["today"] = line
                         me["day"] = datetime.now().strftime("%Y-%m-%d")
-                        me["refuse_today"] = float(st2.get("energy") or 0.7) < 0.3
+                        me["refuse_today"] = _num(st2.get("energy"), 0.7) < 0.3
                         _save_self(me)
                         _diary_add("普通", f"（给自己）{line}", st2.get("mood", "平静"), "")
                         logger.info(f"heart: 自己的今天 -> {line}")
