@@ -84,6 +84,29 @@ def _like_undo(uid: str, n: int) -> None:
         pass
 
 
+async def _do_rename(bot, name: str) -> str:
+    """改机器人自己的 QQ 昵称。不同 OneBot 实现叫法不一样，挨个试。"""
+    name = (name or "").strip()
+    if not 1 <= len(name) <= 12:
+        return "名字要 1~12 个字。"
+    errors = []
+    for action, kw in (
+        ("set_qq_profile", {"nickname": name}),
+        ("set_qq_nickname", {"nickname": name}),
+        (
+            "set_qq_profile",
+            {"nickname": name, "company": "", "email": "", "college": "", "personal_note": ""},
+        ),
+    ):
+        try:
+            await bot.call_action(action, **kw)
+            logger.info(f"qq_more: 改名 -> {name}（{action}）")
+            return f"改好了，我现在叫「{name}」。"
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{action}: {exc}")
+    return "改不了：" + "；".join(errors)[:140]
+
+
 @register("qq_more", "dafeiyu", "空间 / 状态 / 戳一戳 / 群头衔", "1.0.0")
 class QQMore(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -226,6 +249,28 @@ class QQMore(Star):
         except Exception as exc:  # noqa: BLE001
             _like_undo(uid, n)
             return f"点赞失败：{exc}"
+
+    @llm_tool(name="change_my_name")
+    async def change_my_name(self, event: AstrMessageEvent, name: str) -> str:
+        """改你自己的 QQ 昵称（主人给你起名、让你改名时用）。
+
+        Args:
+            name(string): 新昵称，1~12 个字
+        """
+        if str(event.get_sender_id()) != _owner():
+            return "只有主人能让我改名。"
+        return await _do_rename(event.bot, name)
+
+    @filter.command("改名")
+    async def cmd_rename(self, event: AstrMessageEvent, name: str = ""):
+        """改机器人自己的 QQ 昵称：/改名 风铃"""
+        if str(event.get_sender_id()) != _owner():
+            yield event.plain_result("只有主人能让我改名。")
+            return
+        if not name:
+            yield event.plain_result("要改成什么？发「/改名 风铃」")
+            return
+        yield event.plain_result(await _do_rename(event.bot, name))
 
     @filter.command("点赞")
     async def cmd_like(self, event: AstrMessageEvent, times: str = "10"):

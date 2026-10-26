@@ -68,12 +68,29 @@ _STOP_GRAMS = frozenset(
 
 _LEARN_PROMPT = """你是一个中文网络用语分析器。根据下面这段聊天，抽取：
 1) 出现的网络梗/黑话/流行语，给出简短含义（没有就给空数组）；
-2) 关于用户、值得长期记住的事实（称呼、作息、喜好、正在做的事；没有就给空数组）。
+2) 关于主人、值得长期记住的事实（称呼、作息、喜好、正在做的事；没有就给空数组）。
+   人称规则：你自己是「我」，对方是「主人」。不要写「用户」「机器人」「她」。
    level 怎么填：称呼、约定、长期不变的喜好 → 非常重要；近期发生的事、临时状态 → 普通；
    介于两者之间（习惯、偏好、正在做的项目）→ 重要。
 只输出 JSON，不要解释：
 {"memes":[{"term":"","meaning":"","example":""}],"notes":[{"text":"","level":"普通"}]}
 """
+
+
+
+_STOP_TERMS = set("""上次 过去 自己 别人 其实 可能 真的 这个 那个 什么 怎么 因为 所以 但是 如果 已经 现在 今天 明天 昨天 感觉 觉得 知道 时候 东西 事情""".split())
+
+def _is_real_meme(term: str) -> bool:
+    """挡掉"上次/自己/过去"这种常用词，它们不是梗。"""
+    t = (term or "").strip()
+    if len(t) < 2:
+        return False
+    if t in _STOP_TERMS:
+        return False
+    # 纯汉字且长度 2-8 才可能是网络用语
+    if not all("\u4e00" <= c <= "\u9fff" or c.isalnum() for c in t):
+        return False
+    return True
 
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -461,6 +478,7 @@ class Soul:
             if picked:
                 lines.append(
                     "【你记得的事 · 按他刚说的话挑的】"
+                    "（这些事里「主人」「用户」都是他；「机器人」「我」都是你自己）"
                     + "；".join(self._fmt_note(n) for n in picked)
                 )
                 lines.append(
@@ -580,6 +598,20 @@ class DafeiyuSoul(Star):
         if len(user_text) < 4 or not bot_text:
             return
 
+        # ---- 攒批：攒够 8 条或空闲 10 分钟再学，省 token ----
+        buf = getattr(self, "_learn_buf", None)
+        if buf is None:
+            buf = self._learn_buf = []
+        buf.append((user_text, bot_text))
+        if len(buf) < 8:
+            if getattr(self, "_learn_timer", None) is None or self._learn_timer.done():
+                self._learn_timer = asyncio.create_task(self._flush_later())
+            return
+        batch = buf[:]
+        self._learn_buf = []
+        user_text = "\n".join(f"用户：{u}\n机器人：{b}" for u, b in batch)[-3000:]
+        bot_text = "（合并批次）"
+
         async def _learn() -> None:
             result = await _extract(user_text, bot_text)
             if not isinstance(result, dict):
@@ -589,6 +621,8 @@ class DafeiyuSoul(Star):
                 term = str(meme.get("term") or "").strip()
                 meaning = str(meme.get("meaning") or "").strip()
                 if not term or not meaning:
+                    continue
+                if not _is_real_meme(term):
                     continue
                 if any(m.get("term") == term for m in self.soul.memes):
                     continue
@@ -632,6 +666,52 @@ class DafeiyuSoul(Star):
 
         self.soul.last_learn_ts = now
         asyncio.create_task(_learn())
+
+
+    async def _flush_later(self):
+        """空闲 10 分钟后把攒的这几条一次学掉。"""
+        await asyncio.sleep(600)
+        buf = getattr(self, "_learn_buf", None) or []
+        if not buf:
+            return
+        self._learn_buf = []
+        text = "\n".join(f"用户：{u}\n机器人：{b}" for u, b in buf)[-3000:]
+        try:
+            result = await _extract(text, "（合并批次）")
+            if isinstance(result, dict):
+                self._apply_learn(result)
+                logger.info(f"心智学习（攒批 {len(buf)} 条）")
+        except Exception:  # noqa: BLE001
+            logger.debug("flush learn failed", exc_info=True)
+
+    def _apply_learn(self, result: dict) -> None:
+        changed = False
+        for meme in result.get("memes") or []:
+            term = str(meme.get("term") or "").strip()
+            meaning = str(meme.get("meaning") or "").strip()
+            if not term or not meaning or not _is_real_meme(term):
+                continue
+            if any(m.get("term") == term for m in self.soul.memes):
+                continue
+            _now = time.time()
+            self.soul.memes.append({"term": term, "meaning": meaning,
+                                    "example": meme.get("example", ""),
+                                    "added": _now, "last_used": _now, "hits": 0})
+            changed = True
+        for note in result.get("notes") or []:
+            note = str(note).strip()
+            if not note or len(note) > 120:
+                continue
+            if any(n.get("text") == note for n in self.soul.notes):
+                continue
+            self.soul.notes.append({"ts": time.time(), "kind": "note", "text": note})
+            changed = True
+        if len(self.soul.memes) > 200:
+            self.soul.memes = self.soul.memes[-200:]
+        if len(self.soul.notes) > 200:
+            self.soul.notes = self.soul.notes[-200:]
+        if changed:
+            self.soul.save()
 
     # ---------- 工具 ----------
     @llm_tool(name="learn_meme")

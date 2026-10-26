@@ -115,8 +115,37 @@ def _state() -> dict:
     return d
 
 
+def _recent_outgoing(limit: int = 5, hours: float = 6.0) -> list[str]:
+    """最近发出去的几句话（用来防止同一件事反复说）。"""
+    try:
+        with io.open(r"D:\AstrBot\recent-outgoing.jsonl", encoding="utf-8") as fh:
+            rows = [json.loads(x) for x in fh if x.strip()][-60:]
+        now = time.time()
+        texts = [
+            str(r.get("text") or "")
+            for r in rows
+            if now - float(r.get("ts") or 0) < hours * 3600
+        ]
+        return texts[-limit:]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _favor_level(favor: float) -> int:
     return max(1, min(10, int(favor // 10) + 1))
+
+
+def _tri_grams(text: str) -> set[str]:
+    t = re.sub(r"\s+", "", str(text or ""))
+    return {t[i:i + 3] for i in range(len(t) - 2)}
+
+
+def _too_similar(a: str, b: str, th: float = 0.34) -> bool:
+    """两句是不是在说同一件事（按三元组重合度粗判）。"""
+    ga, gb = _tri_grams(a), _tri_grams(b)
+    if not ga or not gb:
+        return False
+    return len(ga & gb) / min(len(ga), len(gb)) >= th
 
 
 def _read_diary() -> list[dict]:
@@ -458,6 +487,29 @@ def _refresh_pet_texts(lines: list[str]) -> bool:
     except Exception:  # noqa: BLE001
         return False
 
+
+# ---------- 备份兜底：计划任务没跑成就自己补 ----------
+_BACKUP_DIR = r"D:\AstrBot\backup\memory"
+_BACKUP_SCRIPT = r"D:\AstrBot\scripts\backup_memory.py"
+
+
+def _backup_missing_today() -> bool:
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        return not os.path.exists(os.path.join(_BACKUP_DIR, f"{today}.zip"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _run_backup() -> None:
+    try:
+        import subprocess, sys
+        subprocess.run([sys.executable, _BACKUP_SCRIPT], timeout=300,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:  # noqa: BLE001
+        logger.debug("backup guard failed", exc_info=True)
+
+
 @register("heart", "dafeiyu", "好感度 + 心情 + 三级日记 + 主动找你", "1.0.0")
 class Heart(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -474,6 +526,7 @@ class Heart(Star):
         asyncio.create_task(self._review_loop())
         asyncio.create_task(self._hourly_loop())
         asyncio.create_task(self._pet_texts_loop())
+        asyncio.create_task(self._backup_guard_loop())
         logger.info("heart: 已启动")
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
@@ -726,11 +779,24 @@ class Heart(Star):
         if not umo:
             return
         pending = s.get("pending") or []
-        diary = _fresh_diary()[-2:]
+        now = time.time()
+        # 最近 6 小时主动说过的话，用来避开重复话题
+        wakes = [
+            w for w in (s.get("wake_log") or [])
+            if now - float(w.get("ts") or 0) < 6 * 3600
+        ]
+        if not wakes:
+            # 第一次跑没有记录，就拿最近发出去的话当参考
+            wakes = [{"ts": 0, "text": t} for t in _recent_outgoing(5)]
+        diary_all = _fresh_diary()
+        diary = [
+            d for d in diary_all
+            if not any(_too_similar(str(d.get("text") or ""), str(w.get("text") or "")) for w in wakes)
+        ][-2:]
         kind = "随性"
         if pending and random.random() < 0.45:
             kind = "约定"
-        elif time.time() - float(s.get("last_user_ts") or 0) > 7200:
+        elif now - float(s.get("last_user_ts") or 0) > 7200:
             kind = "想他"
         hint = {
             "约定": f"你之前说过要跟他说的：{pending[-1]}",
@@ -740,9 +806,17 @@ class Heart(Star):
         ctx = "\n".join(f"- {d.get('text','')}" for d in diary) or "（没什么特别的）"
         asked = _recent_asked()
         asked_block = ("\n你 24 小时内问过这些，别再问：\n" + "\n".join(f"- {a}" for a in asked)) if asked else ""
+        wakes_block = ""
+        if wakes:
+            wakes_block = (
+                "\n你最近已经主动跟他说过这些，这次必须换一件别的事，不许重复：\n"
+                + "\n".join(f"- {w.get('text','')}" for w in wakes[-4:])
+            )
         prompt = (
+            "你是大肥鱼（主人给你起名叫风铃），对方是主人。\n"
+            "下面日记里写「我」的是你自己，写「他」的是主人——别把自己做过的事问到他头上。\n"
             f"你现在要主动给主人发一条 QQ 消息。由头：{hint}。\n"
-            f"你最近记得的事：\n{ctx}\n{asked_block}\n"
+            f"你最近记得的事：\n{ctx}\n{asked_block}{wakes_block}\n"
             f"当前心情：{s['mood']}；好感度 Lv.{_favor_level(s['favor'])}。\n"
             "要求：15 字以内，直接说事，不要问「在吗」，不要解释你在做什么，不要用括号。只输出这条消息。"
         )
@@ -755,8 +829,14 @@ class Heart(Star):
             text = re.sub(r"^[\"'「]|[\"'」]$", "", text)
             if not text or len(text) > 60:
                 return
+            # 跟最近说过的话太像就别发，免得同一件事反复刷
+            if any(_too_similar(text, str(w.get("text") or "")) for w in wakes):
+                logger.info(f"heart: 主动消息和最近重复，跳过 -> {text}")
+                return
             await self.context.send_message(session=umo, message_chain=MessageChain([Plain(text)]))
             await self._remember_outgoing(umo, text)
+            s["wake_log"] = (list(s.get("wake_log") or []) + [{"ts": time.time(), "text": text}])[-8:]
+            _save(_STATE, s)
             if kind == "约定" and pending:
                 s["pending"] = pending[:-1]
                 _save(_STATE, s)
@@ -791,8 +871,10 @@ class Heart(Star):
             chat = "\n".join(f"{it['role']}：{it['text']}" for it in items[-40:])
             prompt = (
                 "下面是最近一小时大肥鱼和主人的聊天。用两句话总结：\n"
-                "第一句：聊了什么、他什么状态；\n"
+                "第一句：聊了什么、主人什么状态；\n"
                 "第二句：这轮里有什么没说完、下次可以接着说的。\n"
+                "人称规则：你自己是大肥鱼（主人给你起名风铃），写「我」；对方写「他」。"
+                "不要用「用户」「机器人」「她」这类第三人称。\n"
                 "总字数 60 以内，别用列表，别用括号。\n\n" + chat
             )
             provider = await self.context.get_using_provider_async()
@@ -876,6 +958,21 @@ class Heart(Star):
                 logger.info(f"heart: 桌宠台词已刷新 {len(lines)} 句")
         except Exception:  # noqa: BLE001
             logger.debug("regen pet texts failed", exc_info=True)
+
+
+    # ---------- 备份兜底循环 ----------
+    async def _backup_guard_loop(self):
+        await asyncio.sleep(180)
+        while True:
+            try:
+                if datetime.now().hour >= 5 and _backup_missing_today():
+                    await asyncio.to_thread(_run_backup)
+                    logger.info("heart: 今天的备份没跑，已补一次")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.debug("backup guard loop error", exc_info=True)
+            await asyncio.sleep(3600)
 
     # ---------- 每天 04:00 复盘 ----------
 
