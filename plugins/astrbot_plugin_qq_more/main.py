@@ -112,6 +112,43 @@ class QQMore(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context, config)
 
+    async def _remember_post(self, event: AstrMessageEvent, text: str) -> None:
+        """说说发出去之后记一笔，不然过一会儿她就不认账了。"""
+        note = f"我在 QQ 空间发了条动态（说说）：{text[:60]}"
+        try:
+            with io.open(
+                r"D:\AstrBot\bot\data\plugin_data\dafeiyu_soul\notes.jsonl",
+                "a",
+                encoding="utf-8",
+            ) as fh:
+                fh.write(
+                    json.dumps(
+                        {"ts": time.time(), "kind": "note", "text": note, "level": "普通"},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug("qq_more: 写说说笔记失败", exc_info=True)
+        try:
+            cm = self.context.conversation_manager
+            umo = event.unified_msg_origin
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                return
+            conv = await cm.get_conversation(umo, cid)
+            if not conv:
+                return
+            history = json.loads(conv.history or "[]")
+            if not isinstance(history, list):
+                return
+            history.append(
+                {"role": "assistant", "content": f"（我刚在空间发了条说说：{text[:60]}）"}
+            )
+            await cm.update_conversation(umo, cid, history=history)
+        except Exception:  # noqa: BLE001
+            logger.debug("qq_more: 记录说说历史失败", exc_info=True)
+
     @llm_tool(name="post_qzone")
     async def post_qzone(self, event: AstrMessageEvent, content: str) -> str:
         """发一条 QQ 空间说说。
@@ -147,6 +184,7 @@ class QQMore(Star):
             except Exception:  # noqa: BLE001
                 pass
             logger.info(f"qq_more: 发说说 {text[:30]} tid={r}")
+            await self._remember_post(event, text)
             return "发了，你去空间看看。"
         except Exception as exc:  # noqa: BLE001
             return f"说说没发出去：{exc}"
@@ -422,6 +460,7 @@ class QQMore(Star):
             except Exception:  # noqa: BLE001
                 pass
             logger.info(f"qq_more: 发说说 -> {line[:40]} tid={r}")
+            await self._remember_post(event, line)
             yield event.plain_result(f"发好了：「{line}」\n去空间看看")
         except Exception as exc:  # noqa: BLE001
             logger.exception("auto qzone failed")
