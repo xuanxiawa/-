@@ -1,0 +1,7 @@
+name: astrbot_plugin_airz
+display_name: A.I.R Z 上下文装配器
+desc: 长对话摘要压缩 + 最近 12 轮原文 + 记忆模糊化 + 提示词体积审计
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

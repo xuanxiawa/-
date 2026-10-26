@@ -336,7 +336,8 @@ class Soul:
                 continue
             w = self._note_weight(n)
             ts = float(n.get("ts") or now)
-            if w < 0.12 and (now - ts) > 90 * 86400:
+            # 0.02~0.1 之间是 A.I.R Z 的「模糊碎片」区，别在这里删掉
+            if w < 0.02 and (now - ts) > 120 * 86400:
                 continue
             keep.append(n)
         if len(keep) != before:
