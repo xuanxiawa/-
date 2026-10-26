@@ -31,6 +31,59 @@ def _owner() -> str:
         return "3448098168"
 
 
+
+_LIKE_FILE = r"D:\AstrBot\like-count.json"
+
+
+_LIKE_DAILY = 10  # 每人每天最多点几个（QQ 名片赞的上限就是 10）
+
+
+def _like_allow(uid: str, want: int) -> int:
+    """每人每天最多点 _LIKE_DAILY 个；返回今天还能点的次数。"""
+    import time as _t
+    today = _t.strftime("%Y-%m-%d")
+    data = {}
+    try:
+        with io.open(_LIKE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh) or {}
+    except Exception:  # noqa: BLE001
+        data = {}
+    if data.get("date") != today:
+        data = {"date": today, "counts": {}}
+    counts = data.setdefault("counts", {})
+    used = int(counts.get(uid, 0))
+    left = max(0, _LIKE_DAILY - used)
+    take = min(left, max(0, want))
+    if take > 0:
+        counts[uid] = used + take
+        try:
+            with io.open(_LIKE_FILE, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            pass
+    return take
+
+
+def _like_undo(uid: str, n: int) -> None:
+    """点赞失败了，把刚才扣掉的额度还回去，别白白浪费一天的名额。"""
+    if n <= 0:
+        return
+    try:
+        import time as _t
+        today = _t.strftime("%Y-%m-%d")
+        with io.open(_LIKE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh) or {}
+        if data.get("date") != today:
+            return
+        counts = data.get("counts") or {}
+        counts[uid] = max(0, int(counts.get(uid, 0)) - int(n))
+        data["counts"] = counts
+        with io.open(_LIKE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @register("qq_more", "dafeiyu", "空间 / 状态 / 戳一戳 / 群头衔", "1.0.0")
 class QQMore(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -158,6 +211,9 @@ class QQMore(Star):
                 n = min(n, 3)
         except Exception:  # noqa: BLE001
             pass
+        n = _like_allow(uid, n)
+        if n == 0:
+            return f"今天已经给 {uid} 点满 {_LIKE_DAILY} 个了，明天再说。"
         try:
             await event.bot.call_action("send_like", user_id=int(uid), times=n)
             logger.info(f"qq_more: 给 {uid} 点赞 x{n}")
@@ -168,6 +224,7 @@ class QQMore(Star):
                 pass
             return f"给 {uid} 点了 {n} 个赞。"
         except Exception as exc:  # noqa: BLE001
+            _like_undo(uid, n)
             return f"点赞失败：{exc}"
 
     @filter.command("点赞")
@@ -177,10 +234,15 @@ class QQMore(Star):
             n = max(1, min(10, int(float(times or 10))))
         except Exception:  # noqa: BLE001
             n = 10
+        n2 = _like_allow(str(event.get_sender_id()), n)
+        if n2 == 0:
+            yield event.plain_result(f"今天已经给你点满 {_LIKE_DAILY} 个了，明天再点。")
+            return
         try:
-            await event.bot.call_action("send_like", user_id=int(event.get_sender_id()), times=n)
-            yield event.plain_result(f"点了 {n} 个赞。")
+            await event.bot.call_action("send_like", user_id=int(event.get_sender_id()), times=n2)
+            yield event.plain_result(f"给你点了 {n2} 个赞。")
         except Exception as exc:  # noqa: BLE001
+            _like_undo(str(event.get_sender_id()), n2)
             yield event.plain_result(f"点赞失败：{exc}")
 
     @filter.regex(r"点(个)?赞|赞我|赞一下|给我赞")
@@ -189,11 +251,16 @@ class QQMore(Star):
         text = (event.message_str or "").strip()
         if len(text) > 30:
             return
+        left = _like_allow(str(event.get_sender_id()), _LIKE_DAILY)
+        if left == 0:
+            yield event.plain_result("今天给你点满了，明天再点哈")
+            return
         try:
-            await event.bot.call_action("send_like", user_id=int(event.get_sender_id()), times=10)
-            logger.info(f"qq_more: 关键词触发点赞 -> {event.get_sender_id()}")
-            yield event.plain_result("点啦，十个，够不够")
+            resp = await event.bot.call_action("send_like", user_id=int(event.get_sender_id()), times=left)
+            logger.info(f"qq_more: 关键词触发点赞 x{left} -> {event.get_sender_id()}，返回 {resp}")
+            yield event.plain_result(f"给你点了 {left} 个赞，够不够")
         except Exception as exc:  # noqa: BLE001
+            _like_undo(str(event.get_sender_id()), left)
             logger.exception("auto like failed")
             yield event.plain_result(f"点不了诶：{exc}")
 
