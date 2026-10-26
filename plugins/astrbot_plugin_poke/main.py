@@ -86,19 +86,35 @@ class PokeBack(Star):
         except Exception:  # noqa: BLE001
             logger.debug("poke: 写对话历史失败", exc_info=True)
 
+    def _poke_target(self, event: AstrMessageEvent) -> str:
+        """这次戳一戳戳的是谁（OneBot 的 target_id）。"""
+        try:
+            for comp in event.get_messages():
+                if comp.type == "poke" or isinstance(comp, Poke):
+                    return str(getattr(comp, "id", "") or "")
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_poke(self, event: AstrMessageEvent):
         if not self._is_poke(event):
             return
+        # 戳的不是我就别插嘴（群里别人互相戳很常见）
+        target = self._poke_target(event)
+        me = str(event.get_self_id() or "")
+        if target and me and target != me:
+            return
         uid = str(event.get_sender_id())
-        # 只回应主人
         try:
             with io.open(_UMO, encoding="utf-8") as fh:
                 umo = fh.read().strip()
         except Exception:  # noqa: BLE001
             umo = ""
         owner = umo.split(":")[-1] if umo else ""
-        if owner and uid != owner:
+        in_group = bool(event.get_group_id())
+        # 私聊只回应主人；群里谁戳她都会应一句
+        if not in_group and owner and uid != owner:
             return
 
         mood = _mood()
@@ -147,8 +163,8 @@ class PokeBack(Star):
         _append_recent(f"戳了戳你（你回了：{line}）")
         logger.info(f"poke: 被 {uid} 戳了，回：{line}")
 
-        # 一半概率戳回去
-        if random.random() < 0.5:
+        # 一半概率戳回去；群里只对主人回戳，别去惹别人
+        if random.random() < 0.5 and (not in_group or uid == owner):
             try:
                 kwargs = {"user_id": int(uid)}
                 gid = event.get_group_id()

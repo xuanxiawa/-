@@ -80,6 +80,17 @@ _LEARN_PROMPT = """你是一个中文网络用语分析器。根据下面这段�
 
 _STOP_TERMS = set("""上次 过去 自己 别人 其实 可能 真的 这个 那个 什么 怎么 因为 所以 但是 如果 已经 现在 今天 明天 昨天 感觉 觉得 知道 时候 东西 事情""".split())
 
+
+def _owner_qq() -> str:
+    """主人的 QQ 号：从 heart 记的 umo 里取最后一段。取不到就返回空。"""
+    try:
+        with open(r"D:\AstrBot\bot\data\plugin_data\heart\umo.txt", encoding="utf-8") as fh:
+            umo = fh.read().strip()
+        return umo.split(":")[-1] if umo else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _is_real_meme(term: str) -> bool:
     """挡掉"上次/自己/过去"这种常用词，它们不是梗。"""
     t = (term or "").strip()
@@ -598,46 +609,67 @@ class DafeiyuSoul(Star):
         if len(user_text) < 4 or not bot_text:
             return
 
+        # 群里别人说的话：只学梗，不写「主人的笔记」
+        is_group = bool(event.get_group_id())
+        is_owner = str(event.get_sender_id()) == _owner_qq()
+        allow_notes = (not is_group) or is_owner
+
         # ---- 攒批：攒够 8 条或空闲 10 分钟再学，省 token ----
         buf = getattr(self, "_learn_buf", None)
         if buf is None:
             buf = self._learn_buf = []
-        buf.append((user_text, bot_text))
+        buf.append((user_text, bot_text, allow_notes))
         if len(buf) < 8:
             if getattr(self, "_learn_timer", None) is None or self._learn_timer.done():
                 self._learn_timer = asyncio.create_task(self._flush_later())
             return
         batch = buf[:]
         self._learn_buf = []
-        user_text = "\n".join(f"用户：{u}\n机器人：{b}" for u, b in batch)[-3000:]
-        bot_text = "（合并批次）"
+        merged = "\n".join(f"用户：{u}\n机器人：{b}" for u, b, _ in batch)[-3000:]
+        need_notes = all(flag for _u, _b, flag in batch)
 
         async def _learn() -> None:
-            result = await _extract(user_text, bot_text)
-            if not isinstance(result, dict):
-                return
-            changed = False
-            for meme in result.get("memes") or []:
-                term = str(meme.get("term") or "").strip()
-                meaning = str(meme.get("meaning") or "").strip()
-                if not term or not meaning:
-                    continue
-                if not _is_real_meme(term):
-                    continue
-                if any(m.get("term") == term for m in self.soul.memes):
-                    continue
-                _now = time.time()
-                self.soul.memes.append(
-                    {
-                        "term": term,
-                        "meaning": meaning,
-                        "example": meme.get("example", ""),
-                        "added": _now,
-                        "last_used": _now,
-                        "hits": 0,
-                    }
-                )
-                changed = True
+            result = await _extract(merged, "（合并批次）")
+            if isinstance(result, dict):
+                self._apply_learn(result, allow_notes=need_notes)
+
+        self.soul.last_learn_ts = now
+        asyncio.create_task(_learn())
+
+
+    async def _flush_later(self):
+        """空闲 10 分钟后把攒的这几条一次学掉。"""
+        await asyncio.sleep(600)
+        buf = getattr(self, "_learn_buf", None) or []
+        if not buf:
+            return
+        self._learn_buf = []
+        rows = [(b[0], b[1], b[2] if len(b) > 2 else True) for b in buf]
+        text = "\n".join(f"用户：{u}\n机器人：{b}" for u, b, _ in rows)[-3000:]
+        need_notes = all(flag for _u, _b, flag in rows)
+        try:
+            result = await _extract(text, "（合并批次）")
+            if isinstance(result, dict):
+                self._apply_learn(result, allow_notes=need_notes)
+                logger.info(f"心智学习（攒批 {len(rows)} 条）")
+        except Exception:  # noqa: BLE001
+            logger.debug("flush learn failed", exc_info=True)
+
+    def _apply_learn(self, result: dict, allow_notes: bool = True) -> None:
+        changed = False
+        for meme in result.get("memes") or []:
+            term = str(meme.get("term") or "").strip()
+            meaning = str(meme.get("meaning") or "").strip()
+            if not term or not meaning or not _is_real_meme(term):
+                continue
+            if any(m.get("term") == term for m in self.soul.memes):
+                continue
+            _now = time.time()
+            self.soul.memes.append({"term": term, "meaning": meaning,
+                                    "example": meme.get("example", ""),
+                                    "added": _now, "last_used": _now, "hits": 0})
+            changed = True
+        if allow_notes:
             for note in result.get("notes") or []:
                 if isinstance(note, dict):
                     note_text = str(note.get("text") or "").strip()
@@ -654,58 +686,6 @@ class DafeiyuSoul(Star):
                     {"ts": time.time(), "kind": "note", "text": note_text, "level": level}
                 )
                 changed = True
-            if len(self.soul.memes) > 200:
-                self.soul.memes = self.soul.memes[-200:]
-            if len(self.soul.notes) > 200:
-                self.soul.notes = self.soul.notes[-200:]
-            if changed:
-                self.soul.save()
-                logger.info(
-                    f"心智学习：梗 {len(self.soul.memes)} 条 / 笔记 {len(self.soul.notes)} 条"
-                )
-
-        self.soul.last_learn_ts = now
-        asyncio.create_task(_learn())
-
-
-    async def _flush_later(self):
-        """空闲 10 分钟后把攒的这几条一次学掉。"""
-        await asyncio.sleep(600)
-        buf = getattr(self, "_learn_buf", None) or []
-        if not buf:
-            return
-        self._learn_buf = []
-        text = "\n".join(f"用户：{u}\n机器人：{b}" for u, b in buf)[-3000:]
-        try:
-            result = await _extract(text, "（合并批次）")
-            if isinstance(result, dict):
-                self._apply_learn(result)
-                logger.info(f"心智学习（攒批 {len(buf)} 条）")
-        except Exception:  # noqa: BLE001
-            logger.debug("flush learn failed", exc_info=True)
-
-    def _apply_learn(self, result: dict) -> None:
-        changed = False
-        for meme in result.get("memes") or []:
-            term = str(meme.get("term") or "").strip()
-            meaning = str(meme.get("meaning") or "").strip()
-            if not term or not meaning or not _is_real_meme(term):
-                continue
-            if any(m.get("term") == term for m in self.soul.memes):
-                continue
-            _now = time.time()
-            self.soul.memes.append({"term": term, "meaning": meaning,
-                                    "example": meme.get("example", ""),
-                                    "added": _now, "last_used": _now, "hits": 0})
-            changed = True
-        for note in result.get("notes") or []:
-            note = str(note).strip()
-            if not note or len(note) > 120:
-                continue
-            if any(n.get("text") == note for n in self.soul.notes):
-                continue
-            self.soul.notes.append({"ts": time.time(), "kind": "note", "text": note})
-            changed = True
         if len(self.soul.memes) > 200:
             self.soul.memes = self.soul.memes[-200:]
         if len(self.soul.notes) > 200:
