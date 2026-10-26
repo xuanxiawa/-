@@ -133,12 +133,17 @@ class Airz(Star):
             keep = MAX_TURNS * 2
             watermark = int(state.get("watermark") or 0)
             summary = str(state.get("summary") or "")
+            if watermark > len(history):
+                # 历史被别人删过（/reset、清理），水位作废，从头来
+                watermark, summary = 0, ""
+                state.update({"watermark": 0, "summary": ""})
+                _save_state(state)
 
             # 超过 12 轮：把更早的部分压成摘要
             if len(history) - watermark > keep:
                 old = history[watermark: len(history) - keep]
                 if old:
-                    summary = await self._summarize(summary, old)
+                    summary = await self._summarize(summary, old, umo)
                     watermark = len(history) - keep
                     state.update({"watermark": watermark, "summary": summary})
                     _save_state(state)
@@ -148,9 +153,19 @@ class Airz(Star):
 
             # 重新装配：摘要进 system_prompt，原文只留最近 12 轮
             recent = history[watermark:]
-            req.contexts = [
-                {"role": m.get("role"), "content": m.get("content")} for m in recent
+            # 原来的上下文里可能有文件解析结果这类 system 消息，别弄丢
+            keep_sys = [
+                m for m in (req.contexts or [])
+                if isinstance(m, dict) and m.get("role") == "system"
             ]
+            turns = [
+                {"role": m.get("role"), "content": m.get("content")}
+                for m in recent
+                if isinstance(m, dict)
+                and m.get("role") in ("user", "assistant", "system")
+                and m.get("content") is not None
+            ]
+            req.contexts = keep_sys + turns
             add = []
             if summary:
                 add.append(f"【更早的对话摘要】\n{summary[:SUMMARY_CHARS]}")
@@ -201,7 +216,7 @@ class Airz(Star):
             return None
         return cid, history
 
-    async def _summarize(self, old_summary: str, messages: list) -> str:
+    async def _summarize(self, old_summary: str, messages: list, umo: str = "") -> str:
         lines = []
         for m in messages:
             role = "他" if m.get("role") == "user" else "我"
@@ -221,7 +236,7 @@ class Airz(Star):
             prompt += f"\n已经有一段更早的摘要：\n{old_summary[:600]}\n\n把新旧合并成一段。\n"
         prompt += f"\n对话：\n{chat}"
         try:
-            provider = await self.context.get_using_provider_async()
+            provider = await self.context.get_using_provider_async(umo or None)
             if not provider:
                 return old_summary
             resp = await provider.text_chat(prompt=prompt)
