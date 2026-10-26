@@ -401,21 +401,39 @@ class QQMore(Star):
         except Exception:  # noqa: BLE001
             pass
 
+        # 最近真发生过的事——比抽象的兴趣词靠谱，说说要写具体的小事
+        events: list[str] = []
+        try:
+            with io.open(
+                r"D:\AstrBot\bot\data\plugin_data\heart\diary.jsonl", encoding="utf-8"
+            ) as fh:
+                rows = [json.loads(x) for x in fh if x.strip()][-6:]
+            for r in rows:
+                t = str(r.get("text") or "").strip()
+                if t and t not in events:
+                    events.append(t[:60])
+        except Exception:  # noqa: BLE001
+            pass
+
         line = ""
         try:
             provider = await self.context.get_using_provider_async(event.unified_msg_origin)
             if provider:
+                scene = (
+                    "\n".join(f"- {e}" for e in events[-3:])
+                    if events
+                    else "- 今天没什么特别的，写点日常感受"
+                )
                 prompt = (
-                    "写一条要发到 QQ 空间的说说。你是住在 QQ 里的小鲸鱼娘。\n"
+                    "你要发一条 QQ 空间说说，像普通女生随手发的那种，不是文案。\n"
+                    f"今天真发生过的事（只能挑一件写，不许拼接两件）：\n{scene}\n"
                     f"你现在的心情：{mood}；精力：{energy:.2f}\n"
-                    f"你最近喜欢的主题：{liked or '还比较杂'}\n"
-                    f"你刚看的视频：《{watch_title or '没看什么'}》{('，画面里：' + watch_fact) if watch_fact else ''}\n"
                     "要求：\n"
-                    "1) 只讲**一件事**，不要拼接两个话题\n"
-                    "2) 20~40 字，是一个完整的意思\n"
-                    "3) 心情好就活泼一点，累了就安静一点\n"
-                    "4) 不要出现「戳我」「干嘛」「在吗」这类对话用语\n"
-                    "5) 不提你俩的关系，不带话题标签\n"
+                    "1) 只写一件具体的小事，要有细节（什么东西、什么时候、什么动作）\n"
+                    "2) 第一人称口语，20~45 字，可以带一个语气词\n"
+                    "3) 不要总结、不要升华，别用「想起…」「有点…了」这种收尾\n"
+                    "4) 不写视频/直播标题，不写游戏术语，不写「戳我」「在吗」「干嘛」\n"
+                    "5) 不要像广告，不要 emoji 连发\n"
                     "只输出说说本身。"
                 )
                 resp = await provider.text_chat(prompt=prompt)
@@ -424,14 +442,15 @@ class QQMore(Star):
             logger.debug("qzone compose failed", exc_info=True)
 
         # ---- 质量闸：拼凑/太短/对话题材的，退回重写一次 ----
-        bad = ("戳我", "干嘛", "在吗", "你说", "他说")
+        bad = ("戳我", "干嘛", "在吗", "你说", "他说", "想起", "「", "强化")
         if not line or len(line) < 10 or any(b in line for b in bad):
             try:
                 provider = await self.context.get_using_provider_async(event.unified_msg_origin)
                 if provider:
                     retry = (
-                        f"重写一条 QQ 空间说说：20~40 字，只讲一件事，心情是「{mood}」。"
-                        "不要出现对话用语，不要拼接话题。只输出说说本身。"
+                        f"重写一条 QQ 空间说说：20~45 字，只写一件具体的小事，第一人称口语，"
+                        f"心情是「{mood}」。不要总结腔，不要视频标题，不要游戏术语，不要对话用语。"
+                        "只输出说说本身。"
                     )
                     resp = await provider.text_chat(prompt=retry)
                     cand = (getattr(resp, "completion_text", "") or "").strip().strip('"「」')
