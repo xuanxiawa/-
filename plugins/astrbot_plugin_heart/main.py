@@ -559,11 +559,19 @@ class Heart(Star):
             _save(_STATE, s)
             lv = _favor_level(s["favor"])
             diary = _fresh_diary()[-2:]
+            gid = event.get_group_id()
+            speaker = (event.get_sender_name() or "").strip()
             block = [
                 "【你心里的状态】（不要报数值，用语气带出来）",
                 f"- 好感度 Lv.{lv}（基础印象，不影响你怎么表达喜欢）",
                 f"- 现在心情：{s['mood']}",
             ]
+            if gid:
+                block.insert(
+                    0,
+                    f"【群聊】现在跟你说话的是「{speaker or '群友'}」；"
+                    "下面提到的「他」都只指这个人，别把别人做的事算到他头上。",
+                )
             hint = MOOD_HINTS.get(str(s.get("mood") or ""))
             if hint:
                 block.append(f"- {hint}")
@@ -573,7 +581,7 @@ class Heart(Star):
             elif e > 0.85:
                 block.append("- 你精神很好，话多一点、愿意闹")
             idle_h = (time.time() - float(s.get("last_user_ts") or 0)) / 3600.0
-            if idle_h >= 3:
+            if idle_h >= 3 and not gid:
                 block.append(f"- 他已经 {idle_h:.0f} 小时没说话了：第一句要让他看出你在等，不要说「中午好」这种话")
             if diary:
                 block.append("【你最近记的事】")

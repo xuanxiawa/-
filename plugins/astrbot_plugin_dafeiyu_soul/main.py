@@ -452,9 +452,21 @@ class Soul:
                 break
         return out
 
-    def prompt_block(self, query: str = "") -> str:
+    def prompt_block(
+        self, query: str = "", group: tuple[bool, str, bool] | None = None
+    ) -> str:
         s = self.state
-        lines = [
+        lines: list[str] = []
+        if group:
+            _, speaker, is_owner = group
+            who = f"「{speaker}」" if speaker else "群友"
+            tag = "（你的主人）" if is_owner else ""
+            lines.append(f"【这是群聊】现在跟你说话的是{who}{tag}。")
+            lines.append(
+                "「他」只指当前说话的人；记忆里没写名字的事默认是主人的。"
+                "别把群友做的事算到主人头上，也别去管别人之间的事。"
+            )
+        lines += [
             "【你的当前状态 · 只影响语气，不要说出这些数字或属性】",
             f"好奇 {s['curiosity']:.2f}｜无聊 {s['boredom']:.2f}｜"
             f"精力 {s['energy']:.2f}",
@@ -582,7 +594,13 @@ class DafeiyuSoul(Star):
                 self.soul.on_message(text)
                 self.soul.save()
             self.soul.apply_external_delta()
-            block = self.soul.prompt_block(text)
+            gid = event.get_group_id()
+            group = None
+            if gid:
+                speaker = (event.get_sender_name() or "").strip()
+                is_owner = str(event.get_sender_id()) == _owner_qq()
+                group = (True, speaker, is_owner)
+            block = self.soul.prompt_block(text, group=group)
             req.system_prompt = (req.system_prompt or "") + "\n\n" + block
         except Exception:  # noqa: BLE001
             logger.warning("注入心智状态失败", exc_info=True)
