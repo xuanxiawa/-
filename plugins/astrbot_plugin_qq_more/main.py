@@ -107,6 +107,19 @@ async def _do_rename(bot, name: str) -> str:
     return "改不了：" + "；".join(errors)[:140]
 
 
+
+# 关键词兜底默认关闭：让她自己判断要不要用工具。
+# 需要临时恢复兜底：建一个空文件 D:\AstrBot\bot\data\plugin_data\keyword_fallback.on
+_FALLBACK_FLAG = r"D:\AstrBot\bot\data\plugin_data\keyword_fallback.on"
+
+
+def _keyword_fallback_on() -> bool:
+    try:
+        return os.path.exists(_FALLBACK_FLAG)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @register("qq_more", "dafeiyu", "空间 / 状态 / 戳一戳 / 群头衔", "1.0.0")
 class QQMore(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -331,6 +344,8 @@ class QQMore(Star):
     @filter.regex(r"点(个)?赞|赞我|赞一下|给我赞")
     async def auto_like(self, event: AstrMessageEvent):
         """说到点赞就直接点，不依赖模型记得调工具。"""
+        if not _keyword_fallback_on():
+            return
         text = (event.message_str or "").strip()
         if len(text) > 30:
             return
@@ -350,6 +365,8 @@ class QQMore(Star):
     @filter.regex(r"发(一)?(个|条)?(说说|空间|动态)")
     async def auto_qzone(self, event: AstrMessageEvent):
         """他说"发个说说"时，现场生成一条再发（带冷却，防连发）。"""
+        if not _keyword_fallback_on():
+            return
         if str(event.get_sender_id()) != _owner():
             return
         text = (event.message_str or "").strip()

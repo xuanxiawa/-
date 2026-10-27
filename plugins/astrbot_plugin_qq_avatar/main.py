@@ -92,6 +92,19 @@ def _pick_from_pool() -> str | None:
     return random.choice(files) if files else None
 
 
+
+# 关键词兜底默认关闭：让她自己判断要不要用工具。
+# 需要临时恢复兜底：建一个空文件 D:\AstrBot\bot\data\plugin_data\keyword_fallback.on
+_FALLBACK_FLAG = r"D:\AstrBot\bot\data\plugin_data\keyword_fallback.on"
+
+
+def _keyword_fallback_on() -> bool:
+    try:
+        return os.path.exists(_FALLBACK_FLAG)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @register("qq_avatar", "dafeiyu", "让她自己换头像 / 昵称 / 签名", "1.0.0")
 class QQAvatar(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -191,6 +204,8 @@ class QQAvatar(Star):
     @filter.regex(r"换(一下)?头像|把头像换|头像换(一)?(下|成)|换这张|换那张|就这张|用这张|换成这个")
     async def auto_switch(self, event: AstrMessageEvent):
         """自然语言里说到换头像就直接执行，不依赖模型记得调工具。"""
+        if not _keyword_fallback_on():
+            return
         if not _is_owner(event):
             return
         text = (event.message_str or "").strip()

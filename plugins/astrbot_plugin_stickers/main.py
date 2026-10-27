@@ -159,6 +159,19 @@ def _pack_candidates(query: str, limit: int = 12) -> list[tuple[str, str]]:
     return out[:limit]
 
 
+
+# 关键词兜底默认关闭：让她自己判断要不要用工具。
+# 需要临时恢复兜底：建一个空文件 D:\AstrBot\bot\data\plugin_data\keyword_fallback.on
+_FALLBACK_FLAG = r"D:\AstrBot\bot\data\plugin_data\keyword_fallback.on"
+
+
+def _keyword_fallback_on() -> bool:
+    try:
+        return os.path.exists(_FALLBACK_FLAG)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @register("stickers", "dafeiyu", "她自己的表情包库", "1.0.0")
 class MyStickers(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -255,6 +268,8 @@ class MyStickers(Star):
     @filter.regex(r"加(这个|一下)?(表情|表情包)|存(这个|一下)|收(这个|下)|记住这个")
     async def auto_save(self, event: AstrMessageEvent):
         """他说「加这个表情包」就直接存，不依赖模型调工具。"""
+        if not _keyword_fallback_on():
+            return
         text = (event.message_str or "").strip()
         if len(text) > 40:
             return
@@ -273,6 +288,8 @@ class MyStickers(Star):
     @filter.regex(r"用你(存|收)|发你(存|收)|把你(存|收)|你(现在)?有(的|哪些)|发你(现在)?有|发你自己的|你的表情包|发那个(表情|图)|发出来|发我看看|给我看看|看看你的|发来看看")
     async def auto_send(self, event: AstrMessageEvent):
         """他说「用你存的那个」，就把自己库里的发出来。"""
+        if not _keyword_fallback_on():
+            return
         items = _load()
         if not items:
             yield event.plain_result("我还没存过表情包。")

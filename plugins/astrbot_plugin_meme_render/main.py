@@ -71,6 +71,19 @@ def _render(template: str, text: str, image: str = "") -> str | None:
         return None
 
 
+
+# 关键词兜底默认关闭：让她自己判断要不要用工具。
+# 需要临时恢复兜底：建一个空文件 D:\AstrBot\bot\data\plugin_data\keyword_fallback.on
+_FALLBACK_FLAG = r"D:\AstrBot\bot\data\plugin_data\keyword_fallback.on"
+
+
+def _keyword_fallback_on() -> bool:
+    try:
+        return os.path.exists(_FALLBACK_FLAG)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @register("meme_render_qq", "dafeiyu", "QQ 里的模板表情：举牌 / 想 / 上联 / 葱卷", "1.0.0")
 class MemeRenderQQ(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -104,6 +117,8 @@ class MemeRenderQQ(Star):
     @filter.regex(r"做\s*(?:个|一个|一|一张|张)?\s*表情|来\s*(?:个|一个|一|一张|张)?\s*表情|画\s*(?:个|一个|一|一张|张)?|举牌|上联|下联|对联|葱卷|抱(一下|你一下|这个|我)|来(个)?抱|要抱")
     async def auto_render(self, event: AstrMessageEvent):
         """自然语言要表情时直接做，不依赖模型记得调工具。"""
+        if not _keyword_fallback_on():
+            return
         text = (event.message_str or "").strip()
         if len(text) > 50:
             return

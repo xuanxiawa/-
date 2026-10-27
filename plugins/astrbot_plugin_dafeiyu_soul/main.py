@@ -692,6 +692,14 @@ class Soul:
             "（答应了要做图、要发图、要存图，就当场调用工具；真做不了就直说，"
             "别答应「等会做」「马上就好」然后没动静。）"
         )
+        lines.append(
+            "【你能自己做的事 · 不用问，直接调工具】\n"
+            "- 做表情包 render_meme｜发表情 send_sticker｜存表情 save_sticker\n"
+            "- 点赞 like_user｜发说说 post_qzone｜改昵称 change_my_name｜换头像 set_my_avatar\n"
+            "- 翻旧聊天 search_old_chat｜记笔记 remember_note｜学梗 learn_meme\n"
+            "- 看屏幕 look_at_screen｜看 B 站 bili_*｜听声音 listen_to_pc\n"
+            "原则：他提需求，能做的当场做，做完只说结果；做不到就直说，别只答应不动手。"
+        )
         return "\n".join(lines)
 
 
