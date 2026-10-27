@@ -591,15 +591,24 @@ class Soul:
         return out
 
     def prompt_block(
-        self, query: str = "", group: tuple[bool, str, bool] | None = None
+        self, query: str = "", group: tuple | None = None
     ) -> str:
         s = self.state
         lines: list[str] = []
         if group:
-            _, speaker, is_owner = group
+            speaker = str(group[0] or "")
+            is_owner = bool(group[1]) if len(group) > 1 else False
+            at_me = bool(group[2]) if len(group) > 2 else False
+            at_other = bool(group[3]) if len(group) > 3 else False
             who = f"「{speaker}」" if speaker else "群友"
             tag = "（你的主人）" if is_owner else ""
             lines.append(f"【这是群聊】现在跟你说话的是{who}{tag}。")
+            if at_me:
+                lines.append("这条是在 @ 你，直接接话。")
+            elif at_other:
+                lines.append(
+                    "这条 @ 的是别人，不是找你。除非内容确实跟你有关，否则别抢话、别接梗。"
+                )
             lines.append(
                 "「他」只指当前说话的人；记忆里没写名字的事默认是主人的。"
                 "别把群友做的事算到主人头上，也别去管别人之间的事。"
@@ -675,6 +684,10 @@ class Soul:
                 recent_notes = self.weighted_notes(4)
                 if recent_notes:
                     lines.append("【你记得的事】" + "；".join(recent_notes))
+        lines.append(
+            "（切记：正文里不要出现 <tool_call>、function_call、JSON 参数这类标记，"
+            "它们只会在后台执行，写进正文对方会看到乱码。）"
+        )
         return "\n".join(lines)
 
 
@@ -763,7 +776,19 @@ class DafeiyuSoul(Star):
             if gid:
                 speaker = (event.get_sender_name() or "").strip()
                 is_owner = str(event.get_sender_id()) == _owner_qq()
-                group = (True, speaker, is_owner)
+                at_me = at_other = False
+                try:
+                    me = str(event.get_self_id() or "")
+                    for comp in event.get_messages():
+                        if comp.type == "at":
+                            qq = str(getattr(comp, "qq", "") or "")
+                            if qq and qq == me:
+                                at_me = True
+                            elif qq and qq != "all":
+                                at_other = True
+                except Exception:  # noqa: BLE001
+                    pass
+                group = (speaker, is_owner, at_me, at_other)
             block = self.soul.prompt_block(text, group=group)
             req.system_prompt = (req.system_prompt or "") + "\n\n" + block
         except Exception:  # noqa: BLE001

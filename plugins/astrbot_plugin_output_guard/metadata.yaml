@@ -1,0 +1,7 @@
+name: astrbot_plugin_output_guard
+display_name: 输出守卫
+desc: 发送前清掉模型漏出来的 <tool_call> / JSON 工具调用标记
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"
