@@ -623,12 +623,38 @@ class Soul:
             lines.append("- 他已经连续几次没接你的话了，别再追问，安静点。")
 
         if self.memes:
-            recent = self.top_memes(8)
-            self._injected = {str(m.get("term") or "") for m in recent}
-            items = "；".join(
-                f"{m.get('term','')}={str(m.get('meaning',''))[:30]}" for m in recent
-            )
-            lines.append(f"【你会的梗】{items}")
+            now_ts = time.time()
+            # 1) 用得多的老梗
+            picked = list(self.top_memes(8))
+            # 2) 48 小时内新学的（别被老梗压住）
+            fresh = sorted(
+                (
+                    m for m in self.memes
+                    if now_ts - float(m.get("added") or 0) < 48 * 3600
+                ),
+                key=lambda m: float(m.get("added") or 0),
+                reverse=True,
+            )[:3]
+            # 3) 跟当前这句话字面相关的
+            qg = self._grams(query) if query else set()
+            related = [
+                m for m in self.memes
+                if qg & self._grams(str(m.get("term") or ""))
+            ][:3]
+            merged, seen = [], set()
+            for m in picked + fresh + related:
+                term = str(m.get("term") or "")
+                if not term or term in seen:
+                    continue
+                seen.add(term)
+                merged.append(m)
+            merged = merged[:10]
+            self._injected = {str(m.get("term") or "") for m in merged}
+            parts = []
+            for m in merged:
+                tag = "（刚学的）" if now_ts - float(m.get("added") or 0) < 48 * 3600 else ""
+                parts.append(f"{m.get('term','')}{tag}={str(m.get('meaning',''))[:30]}")
+            lines.append(f"【你会的梗】" + "；".join(parts))
             lines.append(
                 "接梗原则：听懂了就顺着用、别解释梗；真想不起来什么意思，就回一句「什么梗」让对方解释。"
             )
