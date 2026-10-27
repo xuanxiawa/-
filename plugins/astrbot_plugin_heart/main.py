@@ -329,12 +329,18 @@ def _diary_add(level: str, text: str, mood: str, unsaid: str = "") -> dict:
 
 
 def _detect_promise(reply: str) -> str:
-    if not reply:
+    """只有「带时间指向的承诺」才算，而且别把「晚点见」这种告别当承诺。"""
+    if not reply or len(reply.strip()) < 6:
         return ""
-    for pat in ["等下", "待会", "一会儿", "回头", "看完", "听完", "明天", "晚点"]:
-        if pat in reply:
-            return reply.strip()[:80]
-    return ""
+    text = reply.strip()
+    time_words = ("等下", "待会", "一会儿", "回头", "明天", "晚点", "今晚")
+    if not any(p in text for p in time_words):
+        return ""
+    # 纯告别不记：这类话隔天再看就完全没意义了
+    farewells = ("晚点见", "明天见", "回头见", "先去睡", "先睡了", "晚安", "拜拜", "睡了")
+    if any(f in text for f in farewells):
+        return ""
+    return text[:80]
 
 
 _ASKED = os.path.join(_DATA, "asked.jsonl")
@@ -636,8 +642,12 @@ class Heart(Star):
             s["last_bot_ts"] = time.time()
             if promise:
                 pend = s.get("pending") or []
-                if promise not in pend:
-                    pend.append(promise)
+                texts = [
+                    (p.get("text") if isinstance(p, dict) else str(p)) for p in pend
+                ]
+                if promise not in texts:
+                    # 带上时间：过期的话就不该再拿出来说
+                    pend.append({"text": promise, "ts": time.time()})
                     s["pending"] = pend[-10:]
             _save(_STATE, s)
             _remember_asked(text)
@@ -788,6 +798,15 @@ class Heart(Star):
             return
         pending = s.get("pending") or []
         now = time.time()
+        # 只保留 12 小时内的约定；「晚点见」这种过了一夜就作废
+        pend_items = []
+        for p in pending:
+            if isinstance(p, dict):
+                t, ts = str(p.get("text") or ""), float(p.get("ts") or 0)
+            else:
+                t, ts = str(p or ""), 0.0
+            if t and (now - ts) < 12 * 3600:
+                pend_items.append({"text": t, "ts": ts})
         # 最近 6 小时主动说过的话，用来避开重复话题
         wakes = [
             w for w in (s.get("wake_log") or [])
@@ -802,12 +821,22 @@ class Heart(Star):
             if not any(_too_similar(str(d.get("text") or ""), str(w.get("text") or "")) for w in wakes)
         ][-2:]
         kind = "随性"
-        if pending and random.random() < 0.45:
+        if pend_items and random.random() < 0.45:
             kind = "约定"
         elif now - float(s.get("last_user_ts") or 0) > 7200:
             kind = "想他"
+        last_pend = pend_items[-1] if pend_items else None
+        if last_pend:
+            age_h = (now - float(last_pend["ts"] or now)) / 3600.0
+            pend_hint = (
+                f"你 {age_h:.0f} 小时前跟他说过「{last_pend['text']}」，该兑现了。"
+                "用现在的口吻自然地提一句，不要照抄原话；"
+                "如果这事已经过去了（比如当时说的是「晚点见」，现在已经晚上了），就换个说法或干脆聊别的。"
+            )
+        else:
+            pend_hint = "你有点想他了，想找个话头"
         hint = {
-            "约定": f"你之前说过要跟他说的：{pending[-1]}",
+            "约定": pend_hint,
             "想他": "你有点想他了，想找个话头",
             "随性": "你就是突然想跟他说句话",
         }[kind]
@@ -845,8 +874,14 @@ class Heart(Star):
             await self._remember_outgoing(umo, text)
             s["wake_log"] = (list(s.get("wake_log") or []) + [{"ts": time.time(), "text": text}])[-8:]
             _save(_STATE, s)
-            if kind == "约定" and pending:
-                s["pending"] = pending[:-1]
+            if kind == "约定" and last_pend:
+                rest = []
+                for p in s.get("pending") or []:
+                    t = p.get("text") if isinstance(p, dict) else str(p)
+                    if t == last_pend["text"]:
+                        continue
+                    rest.append(p)
+                s["pending"] = rest[-10:]
                 _save(_STATE, s)
             logger.info(f"heart: 主动[{kind}] -> {text}")
         except Exception:  # noqa: BLE001
