@@ -33,6 +33,7 @@ SUMMARY_CHARS = 1200    # 摘要上限（字）
 TOKEN_WARN = 10000      # 注入超过这个 token 数就告警
 FUZZY_PREFIX = 26       # 模糊记忆只留前几个字
 FUZZY_MAX = 4           # 一次最多塞几条碎片
+SUMMARY_BATCH = 8       # 攒够几条被挤出去的消息才调一次模型做摘要
 
 _HALF_LIFE = {"普通": 30.0, "重要": 90.0, "非常重要": 3650.0}
 
@@ -151,33 +152,32 @@ class Airz(Star):
             cid, history = got
             state = _load_state()
             if state.get("cid") != cid:
-                state = {"cid": cid, "watermark": 0, "summary": ""}
+                state = {"cid": cid, "summary": "", "buffer": []}
 
             keep = MAX_TURNS * 2
-            watermark = int(state.get("watermark") or 0)
             summary = str(state.get("summary") or "")
-            if watermark > len(history):
-                # 历史被压短了（压缩后管线只存了窗口内的）：水位归零，但摘要必须留着
-                watermark = 0
-                state.update({"watermark": 0})
-                _save_state(state)
+            buf = list(state.get("buffer") or [])
 
-            # 超过 12 轮：先把要丢的原文归档，再压成摘要
-            if len(history) - watermark > keep:
-                old = history[watermark: len(history) - keep]
-                if old and _archive(old):
-                    summary = await self._summarize(summary, old, umo)
-                    watermark = len(history) - keep
-                    state.update({"watermark": watermark, "summary": summary})
+            # 管线只保存「用过的上下文」，所以数据库里永远只有最近这一窗口。
+            # 因此不能用绝对下标做水位——每轮把超出的部分挤出去、归档、攒够再摘要。
+            recent = history
+            if len(history) > keep:
+                dropped = history[: len(history) - keep]
+                if _archive(dropped):
+                    buf.extend(dropped)
+                    state["buffer"] = buf[-40:]
+                    if len(buf) >= SUMMARY_BATCH:
+                        summary = await self._summarize(summary, buf[-40:], umo)
+                        state.update({"summary": summary, "buffer": []})
+                        logger.info(
+                            f"airz: 归档 {len(dropped)} 条，摘要更新到 {len(summary)} 字"
+                        )
                     _save_state(state)
-                    logger.info(
-                        f"airz: 归档并压缩 {len(old)} 条旧对话 -> 摘要 {len(summary)} 字"
-                    )
-                elif old:
-                    logger.warning("airz: 归档失败，这次不压缩（不能只删不存）")
+                    recent = history[-keep:]
+                else:
+                    logger.warning("airz: 归档失败，这轮不裁剪（不能只删不存）")
 
             # 重新装配：摘要进 system_prompt，原文只留最近 12 轮
-            recent = history[watermark:]
             # 原来的上下文里可能有文件解析结果这类 system 消息，别弄丢
             keep_sys = [
                 m for m in (req.contexts or [])
@@ -284,15 +284,16 @@ class Airz(Star):
         cid, history = got
         state = _load_state()
         if state.get("cid") != cid:
-            state = {"watermark": 0, "summary": ""}
+            state = {"summary": "", "buffer": []}
         keep = MAX_TURNS * 2
-        wm = int(state.get("watermark") or 0)
-        recent = history[wm:]
+        recent = history[-keep:]
+        buf = state.get("buffer") or []
         fuzzy = _fuzzy_notes()
         yield event.plain_result(
             f"总历史 {len(history)} 条\n"
             f"装配：摘要 {len(state.get('summary') or '')} 字 + 最近 {len(recent)} 条"
             f"（上限 {keep}）\n"
-            f"模糊碎片 {len(fuzzy)} 条"
-            + (f"\n下次再聊 {max(0, keep - len(recent)) + 1} 条触发压缩" if len(recent) <= keep else "")
+            f"待摘要 {len(buf)} 条（攒到 {SUMMARY_BATCH} 条自动压）\n"
+            f"模糊碎片 {len(fuzzy)} 条\n"
+            f"归档本：{_ARCHIVE.name}"
         )

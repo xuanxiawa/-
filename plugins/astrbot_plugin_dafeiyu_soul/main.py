@@ -111,6 +111,14 @@ def _msg_text(content) -> str:
     return str(content or "")
 
 
+def _clean_text(t: str) -> str:
+    """去掉系统提醒、图片描述标记和附件路径，只留人话。"""
+    t = re.sub(r"<system_reminder>.*?</system_reminder>", "", t or "")
+    t = re.sub(r"</?image_caption>", "", t)
+    t = re.sub(r"\[Image Attachment:[^\]]*\]", "", t, flags=re.S)
+    return t.strip()
+
+
 def _search_chat_sync(umo: str, kw: str, days: int) -> str:
     """翻原始聊天记录：现役会话 + A.I.R Z 的归档（压缩前的原文）。"""
     cutoff = time.time() - days * 86400
@@ -136,7 +144,7 @@ def _search_chat_sync(umo: str, kw: str, days: int) -> str:
             for m in msgs:
                 if not isinstance(m, dict):
                     continue
-                t = _msg_text(m.get("content"))
+                t = _clean_text(_msg_text(m.get("content")))
                 mt = re.search(
                     r"Current datetime:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})", t
                 )
@@ -173,6 +181,7 @@ def _search_chat_sync(umo: str, kw: str, days: int) -> str:
 
     hits = []
     for ts, role, t in items:
+        t = _clean_text(t)
         if ts < cutoff or kw not in t:
             continue
         i = t.find(kw)
