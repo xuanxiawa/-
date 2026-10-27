@@ -24,6 +24,7 @@ from astrbot.api.star import Context, Star, register
 
 _DATA = Path(r"D:\AstrBot\bot\data\plugin_data\airz")
 _STATE = _DATA / "state.json"
+_ARCHIVE = _DATA / "archive.jsonl"
 _SOUL_NOTES = Path(r"D:\AstrBot\bot\data\plugin_data\dafeiyu_soul\notes.jsonl")
 
 # ---- 可调参数 ----
@@ -82,6 +83,28 @@ def _note_weight(n: dict) -> float:
     return base * (0.5 ** (age_days / hl))
 
 
+def _archive(messages: list) -> bool:
+    """压缩前把原文存进「全量本」。只搬不删，翻旧账靠它。"""
+    try:
+        _DATA.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        with open(_ARCHIVE, "a", encoding="utf-8") as fh:
+            for m in messages:
+                if not isinstance(m, dict):
+                    continue
+                fh.write(
+                    json.dumps(
+                        {"ts": now, "role": m.get("role"), "content": m.get("content")},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("airz: 归档写入失败", exc_info=True)
+        return False
+
+
 def _fuzzy_notes(limit: int = FUZZY_MAX) -> list[str]:
     """挑出「快忘了但还没删」的记忆，只给开头几个字。"""
     try:
@@ -134,22 +157,24 @@ class Airz(Star):
             watermark = int(state.get("watermark") or 0)
             summary = str(state.get("summary") or "")
             if watermark > len(history):
-                # 历史被别人删过（/reset、清理），水位作废，从头来
-                watermark, summary = 0, ""
-                state.update({"watermark": 0, "summary": ""})
+                # 历史被压短了（压缩后管线只存了窗口内的）：水位归零，但摘要必须留着
+                watermark = 0
+                state.update({"watermark": 0})
                 _save_state(state)
 
-            # 超过 12 轮：把更早的部分压成摘要
+            # 超过 12 轮：先把要丢的原文归档，再压成摘要
             if len(history) - watermark > keep:
                 old = history[watermark: len(history) - keep]
-                if old:
+                if old and _archive(old):
                     summary = await self._summarize(summary, old, umo)
                     watermark = len(history) - keep
                     state.update({"watermark": watermark, "summary": summary})
                     _save_state(state)
                     logger.info(
-                        f"airz: 压缩 {len(old)} 条旧对话 -> 摘要 {len(summary)} 字"
+                        f"airz: 归档并压缩 {len(old)} 条旧对话 -> 摘要 {len(summary)} 字"
                     )
+                elif old:
+                    logger.warning("airz: 归档失败，这次不压缩（不能只删不存）")
 
             # 重新装配：摘要进 system_prompt，原文只留最近 12 轮
             recent = history[watermark:]
@@ -169,7 +194,8 @@ class Airz(Star):
             add = []
             if summary:
                 add.append(f"【更早的对话摘要】\n{summary[:SUMMARY_CHARS]}")
-            fuzzy = _fuzzy_notes()
+            # 已经被 soul 召回、写进提示词的，就别再重复塞一遍
+            fuzzy = [x for x in _fuzzy_notes() if x[:8] not in (req.system_prompt or "")]
             if fuzzy:
                 add.append(
                     "【模糊的记忆碎片】（记不太清了，别当成确定的事）\n"

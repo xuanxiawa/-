@@ -18,6 +18,7 @@ import math
 import os
 import random
 import re
+import sqlite3
 import time
 from pathlib import Path
 
@@ -89,6 +90,104 @@ def _owner_qq() -> str:
         return umo.split(":")[-1] if umo else ""
     except Exception:  # noqa: BLE001
         return ""
+
+
+_CHAT_DB = r"D:\AstrBot\bot\data\data_v4.db"
+_AIRZ_ARCHIVE = r"D:\AstrBot\bot\data\plugin_data\airz\archive.jsonl"
+
+
+def _msg_text(content) -> str:
+    """历史里 content 可能是字符串，也可能是分段列表。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for seg in content:
+            if isinstance(seg, dict) and seg.get("type") == "text":
+                out.append(str(seg.get("text") or ""))
+            elif isinstance(seg, str):
+                out.append(seg)
+        return "".join(out)
+    return str(content or "")
+
+
+def _search_chat_sync(umo: str, kw: str, days: int) -> str:
+    """翻原始聊天记录：现役会话 + A.I.R Z 的归档（压缩前的原文）。"""
+    cutoff = time.time() - days * 86400
+    items: list[tuple[float, str, str]] = []  # (时间戳, 角色, 原文)
+
+    # 1) 现役会话（数据库里还在的）
+    if os.path.exists(_CHAT_DB):
+        try:
+            con = sqlite3.connect(f"file:{_CHAT_DB}?mode=ro", uri=True)
+            rows = con.execute(
+                "select content from conversations where user_id=? "
+                "order by updated_at desc limit 3",
+                (umo,),
+            ).fetchall()
+            con.close()
+        except Exception:  # noqa: BLE001
+            rows = []
+        for (content,) in rows:
+            try:
+                msgs = json.loads(content or "[]")
+            except Exception:  # noqa: BLE001
+                continue
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+                t = _msg_text(m.get("content"))
+                mt = re.search(
+                    r"Current datetime:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})", t
+                )
+                ts = time.time()
+                if mt:
+                    try:
+                        ts = time.mktime(
+                            time.strptime(f"{mt.group(1)} {mt.group(2)}", "%Y-%m-%d %H:%M")
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                items.append((ts, "他" if m.get("role") == "user" else "我", t))
+
+    # 2) 归档本（被压缩搬走的原文）
+    try:
+        with open(_AIRZ_ARCHIVE, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                items.append(
+                    (
+                        float(d.get("ts") or 0),
+                        "他" if d.get("role") == "user" else "我",
+                        _msg_text(d.get("content")),
+                    )
+                )
+    except FileNotFoundError:
+        pass
+
+    hits = []
+    for ts, role, t in items:
+        if ts < cutoff or kw not in t:
+            continue
+        i = t.find(kw)
+        snip = t[max(0, i - 30): i + 40].replace("\n", " ").strip()
+        day = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else ""
+        hits.append((ts, day, role, snip))
+
+    if not hits:
+        return f"没翻到含「{kw}」的旧对话（最近 {days} 天）。"
+    hits.sort(key=lambda x: x[0])
+    hits = hits[-6:]
+    lines = [f"翻到 {len(hits)} 条："]
+    for _ts, day, role, snip in hits:
+        lines.append(f"- {day} {role}：{snip}")
+    return "\n".join(lines)
 
 
 def _is_real_meme(term: str) -> bool:
@@ -390,8 +489,8 @@ class Soul:
         }
         return idf, df, n_docs
 
-    def recall(self, query: str, k: int = 6, min_evidence: float = 1.6) -> list[dict]:
-        """按他刚说的话挑记忆：命中词越特别、越新、越重要，越容易被想起来。"""
+    def recall(self, query: str, k: int = 6, min_evidence: float = 1.6) -> list[tuple[dict, float]]:
+        """按他刚说的话挑记忆。返回 [(条目, 选中那一刻的权重)]。"""
         if not query or not self.notes:
             return []
         qg = self._grams(query)
@@ -430,17 +529,46 @@ class Soul:
             self._last_recall = []
             picked = sorted(self.notes, key=self._note_weight, reverse=True)[:3]
 
-        for n in picked:
+        # 先记下「被想起来那一刻」的权重，再强化，免得压缩级别被刚加的 0.15 顶高
+        out = [(n, self._note_weight(n)) for n in picked][: max(k, 3)]
+        for n, _w in out:
             n["last_hit"] = now
             n["w"] = min(2.0, float(n.get("w") or 1.0) + 0.15)
-        return picked[: max(k, 3)]
+        self._log_hits(query, out)
+        return out
 
-    @staticmethod
-    def _fmt_note(n: dict) -> str:
+    def _log_hits(self, query: str, picked: list[tuple[dict, float]]) -> None:
+        """命中记账：哪句话让她想起了哪几条。审计用，不参与对话。"""
+        try:
+            p = _DIR / "hits.jsonl"
+            row = {
+                "ts": time.time(),
+                "q": str(query or "")[:40],
+                "hits": [str(n.get("text") or "")[:30] for n, _ in picked],
+            }
+            with open(p, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            if p.stat().st_size > 300_000:
+                lines = p.read_text("utf-8").splitlines()[-600:]
+                p.write_text("\n".join(lines) + "\n", "utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _fmt_note(self, n: dict, w: float | None = None) -> str:
+        """按权重分四级压缩：原句 → 一句 → 半句 → 关键词。"""
         ts = float(n.get("ts") or 0)
         day = time.strftime("%m-%d", time.localtime(ts)) if ts else ""
         txt = str(n.get("text") or "").strip()
-        return f"{day} {txt}".strip()
+        weight = self._note_weight(n) if w is None else w
+        if weight >= 0.3:
+            body = txt
+        elif weight >= 0.1:
+            body = txt[:40] + ("…" if len(txt) > 40 else "")
+        elif weight >= 0.05:
+            body = txt[:20] + "…（记得不太全）"
+        else:
+            body = txt[:8] + "…（只记得这几个字）"
+        return f"{day} {body}".strip()
 
     def weighted_notes(self, k: int = 6) -> list[str]:
         scored = sorted(self.notes, key=self._note_weight, reverse=True)
@@ -503,7 +631,7 @@ class Soul:
                 lines.append(
                     "【你记得的事 · 按他刚说的话挑的】"
                     "（这些事里「主人」「用户」都是他；「机器人」「我」都是你自己）"
-                    + "；".join(self._fmt_note(n) for n in picked)
+                    + "；".join(self._fmt_note(n, w) for n, w in picked)
                 )
                 lines.append(
                     "（没挑上的不是忘了，只是这次没想起来。自然地用，别报「我记得…」的清单。）"
@@ -733,6 +861,31 @@ class DafeiyuSoul(Star):
         self.soul.memes.append({"term": term, "meaning": meaning, "example": ""})
         self.soul.save()
         return f"学会了，「{term}」是吧。"
+
+    @llm_tool(name="search_old_chat")
+    async def search_old_chat(
+        self, event: AstrMessageEvent, keyword: str, days: str = "30"
+    ) -> str:
+        """翻以前的聊天记录找原话。记忆里记不清、或者对方问「你忘了？」的时候用它查。
+
+        Args:
+            keyword(string): 要搜的词，尽量具体（人名、物件、地名、说法）
+            days(string): 往回翻多少天，默认 30
+        """
+        kw = (keyword or "").strip()
+        if len(kw) < 2:
+            return "关键词太短了，至少两个字。"
+        try:
+            n_days = max(1, min(365, int(float(days or 30))))
+        except Exception:  # noqa: BLE001
+            n_days = 30
+        try:
+            return await asyncio.to_thread(
+                _search_chat_sync, event.unified_msg_origin, kw, n_days
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("search_old_chat failed", exc_info=True)
+            return "翻记录的时候出错了。"
 
     @llm_tool(name="remember_note")
     async def remember_note(
