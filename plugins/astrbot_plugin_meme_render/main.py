@@ -101,7 +101,7 @@ class MemeRenderQQ(Star):
         except Exception as exc:  # noqa: BLE001
             return f"画出来了但发不出去：{exc}"
 
-    @filter.regex(r"做(个|一|一张)?表情|来(个|一|一张)?表情|画(个|一|一张)|举牌|上联|下联|对联|葱卷|抱(一下|你一下|这个|我)|来(个)?抱|要抱")
+    @filter.regex(r"做\s*(?:个|一个|一|一张|张)?\s*表情|来\s*(?:个|一个|一|一张|张)?\s*表情|画\s*(?:个|一个|一|一张|张)?|举牌|上联|下联|对联|葱卷|抱(一下|你一下|这个|我)|来(个)?抱|要抱")
     async def auto_render(self, event: AstrMessageEvent):
         """自然语言要表情时直接做，不依赖模型记得调工具。"""
         text = (event.message_str or "").strip()
