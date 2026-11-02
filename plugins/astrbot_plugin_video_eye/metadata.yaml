@@ -1,0 +1,7 @@
+name: astrbot_plugin_video_eye
+display_name: 视频的眼睛
+desc: QQ 视频抽帧 + 视觉模型描述，让风铃真的能看见视频画面
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

@@ -1,0 +1,7 @@
+name: astrbot_plugin_private_debounce
+display_name: 私聊连发合并
+desc: 等他打完两句再一起想、一起回，而不是看一句回一句
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

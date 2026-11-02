@@ -405,13 +405,14 @@ class BrowserBili(Star):
                     comments = result.get("comments") or []
                     cm = "；".join(c[:30] for c in comments[:4]) if comments else "（没拉到评论）"
                     prompt = (
-                        f"你刚在主人的屏幕上刷到一个 B 站视频：《{title}》。\n"
+                        f"你自己刚在 B 站刷到一个视频，觉得有意思，想安利给主人：《{title}》。\n"
                         f"画面：{desc}\n"
                         f"评论区在说：{cm}\n"
-                        "发 QQ 消息跟他分享。必须说清三件事，缺一不可：\n"
+                        "发 QQ 消息跟他分享、顺便安利。必须说清四件事，缺一不可：\n"
                         "1) 这是什么——谁/什么视频/什么片段（一句话点明对象）\n"
                         "2) 里面发生了什么——具体到动作或台词，让他能想象出画面\n"
                         "3) 你的看法——吐槽/惊讶/联想，带口癖和语气词\n"
+                        "4) 用「我刚刷到…」的口气，说清这是你自己发现的、想推荐给他，不是他在看\n"
                         "总共 60 字以内，可以分两三句。不要只喊情绪不交代对象，不要报标题清单，不要『好看吗』。"
                         "只输出消息本身。"
                     )
@@ -431,6 +432,18 @@ class BrowserBili(Star):
             except Exception:
                 pass
             await self._remember_outgoing(umo, text[:200])
+            # 记下「她安利过这部」，陪看时她才知道主人看的是她推荐的
+            try:
+                with io.open(_RECOMMENDED, "a", encoding="utf-8") as fh:
+                    fh.write(
+                        json.dumps(
+                            {"ts": time.time(), "title": title, "url": result.get("url", "")},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001
             logger.debug("browser_bili: 主动通知失败", exc_info=True)
 
@@ -453,9 +466,9 @@ class BrowserBili(Star):
                 logger.exception("bili_explore failed")
                 return f"自己刷失败了：{exc}"
 
-    @filter.command("兴趣")
+    @filter.command("B站兴趣")
     async def interests_cmd(self, event: AstrMessageEvent):
-        """看她现在的兴趣排行、今天刷了几次。"""
+        """看她刷 B 站攒出来的兴趣排行、今天刷了几次（/兴趣 是 soul 的心智兴趣，别撞名）。"""
         try:
             data = {}
             try:
@@ -749,6 +762,17 @@ async def _explore_once() -> dict | None:
     except Exception:  # noqa: BLE001
         cookie = ""
     learned = await asyncio.to_thread(_learn_video, video_url, title, cookie)
+    if not learned:
+        # 字幕要登录 → 退一步：用弹幕 + 评论总结成笔记
+        try:
+            bv = _bvid_of(video_url) or ""
+            dm = await asyncio.to_thread(_fetch_danmaku, bv, 40)
+            cm = comments or []
+            if dm or cm:
+                blob = "弹幕：" + " / ".join(dm[:30]) + "\n评论：" + " / ".join(c[:40] for c in cm[:10])
+                learned = await asyncio.to_thread(_summarize_danmaku, title, blob)
+        except Exception:  # noqa: BLE001
+            learned = ""
 
     history = _load_history()
     history.append(video_url.split("?")[0])
@@ -775,9 +799,9 @@ async def _explore_once() -> dict | None:
     except Exception:  # noqa: BLE001
         pass
     _diary_append(result)
-    # 把"正在看"写进去，聊天时会作为背景注入，让她接得上
+    # 这是她自己刷的，别再写进 watching.json（那是主人的屏幕，陪看插件在读）
     try:
-        with io.open(_WATCHING, "w", encoding="utf-8") as fh:
+        with io.open(_SELF_WATCHING, "w", encoding="utf-8") as fh:
             json.dump(
                 {
                     "title": title,
@@ -791,6 +815,11 @@ async def _explore_once() -> dict | None:
             )
     except Exception:  # noqa: BLE001
         pass
+    # 刷完把页面挪走，免得窗口一直挂着她刚看的视频
+    try:
+        await page.goto("about:blank", timeout=10000)
+    except Exception:  # noqa: BLE001
+        pass
     return result
 
 
@@ -798,6 +827,8 @@ async def _explore_once() -> dict | None:
 
 _VIDEO_NOTES = r"D:\AstrBot\video-notes.jsonl"
 _WATCHING = r"D:\AstrBot\watching.json"
+_SELF_WATCHING = r"D:\AstrBot\bili-self-watching.json"
+_RECOMMENDED = r"D:\AstrBot\bili-recommended.jsonl"
 _DAILY_VIDEO_LIMIT = 10
 _MAX_SUB_CHARS = 8000
 _BILI_UA = {
@@ -1012,6 +1043,40 @@ def urllib_quote(s: str) -> str:
 
 # ================= A+C+E 改造：评论区 / 预算 / 心情联动 =================
 
+
+def _fetch_danmaku(bvid: str, limit: int = 60) -> list[str]:
+    """匿名拉弹幕（XML），返回出现次数最多的几十条文本。"""
+    try:
+        import re as _re
+        from collections import Counter as _Counter
+
+        info = _http_json(f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}")
+        cid = ((info.get("data") or {}).get("cid")) or 0
+        if not cid:
+            return []
+        import urllib.request, zlib
+        req = urllib.request.Request(
+            f"https://api.bilibili.com/x/v1/dm/list.so?oid={cid}", headers=_BILI_UA
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+        try:
+            body = zlib.decompress(raw, -15)   # b 站弹幕是 raw deflate
+        except Exception:  # noqa: BLE001
+            try:
+                body = zlib.decompress(raw)
+            except Exception:  # noqa: BLE001
+                body = raw
+        raw = body.decode("utf-8", "ignore")
+        texts = _re.findall(r"<d [^>]*>([^<]{2,40})</d>", raw)
+        if not texts:
+            return []
+        cnt = _Counter(texts)
+        return [t for t, _ in cnt.most_common(limit)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _fetch_comments(bvid: str, limit: int = 15) -> list[str]:
     """匿名拉评论区，拿不到就返回空列表。"""
     try:
@@ -1122,3 +1187,41 @@ def _explore_mark() -> None:
             json.dump(d, fh, ensure_ascii=False)
     except Exception:  # noqa: BLE001
         pass
+
+# ================= 弹幕 -> 笔记 =================
+
+def _summarize_danmaku(title: str, blob: str) -> str:
+    """把弹幕/评论压成 3 条笔记，写进 video-notes。"""
+    try:
+        import json as _json, urllib.request
+        cfg = _json.load(io.open(r"D:\\AstrBot\\bot\\data\\cmd_config.json", encoding="utf-8-sig"))
+        key = base = None
+        for s in cfg.get("provider_sources", []):
+            if s.get("id") == "deepseek_source":
+                key = (s.get("key") or [""])[0]
+                base = s.get("api_base")
+        if not key or not base:
+            return ""
+        prompt = (
+            f"视频《{title}》的弹幕和评论如下。总结出 3 条这个视频在讲什么、观众反应如何的笔记，"
+            "每条 20 字以内，用「- 」开头。只输出列表。\n\n" + blob[:2500]
+        )
+        payload = {"model": "deepseek-chat", "messages": [
+            {"role": "system", "content": "你只输出 3 条短笔记，不要解释。"},
+            {"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 200}
+        req = urllib.request.Request(
+            base.rstrip("/") + "/chat/completions",
+            data=_json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            d = _json.loads(resp.read().decode("utf-8", "ignore"))
+        note = (d["choices"][0]["message"]["content"] or "").strip()
+        if not note:
+            return ""
+        with io.open(r"D:\\AstrBot\\video-notes.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps({"ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                  "title": title, "notes": note}, ensure_ascii=False) + "\n")
+        return note
+    except Exception:  # noqa: BLE001
+        return ""

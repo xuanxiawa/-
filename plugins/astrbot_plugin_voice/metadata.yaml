@@ -1,0 +1,7 @@
+name: astrbot_plugin_voice
+display_name: 嗓子
+desc: 风铃的语音：才羽桃井音色克隆 + 心情驱动（兴奋会突然唱雨爱，困了不出声），/tts 点播、语音对讲、LLM 自主调用
+version: 2.2.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

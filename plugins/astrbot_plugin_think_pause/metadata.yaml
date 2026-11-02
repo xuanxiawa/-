@@ -1,0 +1,7 @@
+name: astrbot_plugin_think_pause
+display_name: 回话前先想一下
+desc: 按主人这句话的长短，回复前停 0.7~2.5 秒，别秒回
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

@@ -1,0 +1,7 @@
+name: astrbot_plugin_moral
+display_name: 大肥鱼的道德值
+desc: 按社会公认的对错评她的行为：诚实/善意/尊重/边界/负责五维打分，评审模型逐条评，主人只能校准
+version: 2.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

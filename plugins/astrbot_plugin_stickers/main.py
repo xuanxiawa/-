@@ -40,13 +40,105 @@ def _load() -> list[dict]:
 
 def _save(items: list[dict]) -> None:
     _ensure()
+    try:  # 写之前先轮转备份，最多留 5 份，改坏了随时能翻回去
+        import shutil
+        if os.path.exists(_INDEX):
+            for i in range(4, 0, -1):
+                src = f"{_INDEX}.bak{i}"
+                if os.path.exists(src):
+                    os.replace(src, f"{_INDEX}.bak{i + 1}")
+            shutil.copy2(_INDEX, f"{_INDEX}.bak1")
+    except Exception:  # noqa: BLE001
+        pass
     with io.open(_INDEX, "w", encoding="utf-8") as fh:
         json.dump(items, fh, ensure_ascii=False, indent=2)
 
 
+def _sender_key(event) -> str:
+    try:
+        sid = re.sub(r"\W", "", str(event.get_sender_id() or ""))
+    except Exception:  # noqa: BLE001
+        sid = ""
+    return sid or "unknown"
+
+
+def _last_for(event) -> str:
+    """优先用「这个人自己最后发的图」，避免群里别人的图把他盖掉。"""
+    p = os.path.join(_ROOT, f"last_{_sender_key(event)}.img")
+    if os.path.exists(p):
+        return p
+    return _LAST
+
+
+def _log(event_tag: str, **kwargs) -> None:
+    """决策日志：每次存/发都记一行，出问题时能直接回溯是哪一步错的。"""
+    try:
+        rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "op": event_tag}
+        rec.update(kwargs)
+        with io.open(os.path.join(_ROOT, "decisions.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+
 def _norm(tags: str) -> list[str]:
-    parts = re.split(r"[,，\s、]+", tags or "")
-    return [p.strip() for p in parts if p.strip()][:8]
+    """标签清洗：只留短词，去掉整句、标点和重复。"""
+    parts = re.split(r"[,，\s、/|]+", tags or "")
+    out: list[str] = []
+    for p in parts:
+        w = re.sub(r"[^\w\u4e00-\u9fff]", "", p.strip())
+        if not w or len(w) > 8:      # 超过 8 个字多半是整句，不是标签
+            continue
+        if any(ch in w for ch in "。！？!?~…"):
+            continue
+        if w not in out:
+            out.append(w)
+    return out[:6]
+
+
+def _tokens(query: str) -> list[str]:
+    return [t.lower() for t in re.split(r"[,，\s、/|]+", query or "") if t.strip()]
+
+
+def _score(item: dict, tokens: list[str]) -> int:
+    """给一张表情打分：标签精确命中最高，其次标签包含，最后描述包含。"""
+    tags = [str(t).lower() for t in (item.get("tags") or [])]
+    desc = str(item.get("desc") or "").lower()
+    tagline = " ".join(tags)
+    best = 0
+    for tk in tokens:
+        s = 0
+        if tk in tags:
+            s = 12
+        elif tk and tk in tagline:
+            s = 6
+        elif tk and tk in desc:
+            s = 3
+        if s == 0 and len(tk) >= 2:
+            # 拆成两字片段再碰一次（「鲸叫哈气」这种连写）
+            for i in range(len(tk) - 1):
+                frag = tk[i:i + 2]
+                if frag in tagline:
+                    s = max(s, 4)
+                elif frag in desc:
+                    s = max(s, 2)
+        best += s
+    return best
+
+
+def _search(query: str) -> tuple[dict | None, int]:
+    """在库里找最匹配的一张，返回（条目, 分数）。分数 0 就是没找到。"""
+    items = _load()
+    tokens = _tokens(query)
+    if not items or not tokens:
+        return None, 0
+    best, best_score = None, 0
+    for it in reversed(items):   # 新存的优先
+        sc = _score(it, tokens)
+        if sc > best_score:
+            best, best_score = it, sc
+    return best, best_score
 
 
 
@@ -132,10 +224,10 @@ _PACK_ROOT = r"D:\AstrBot\bot\data\plugin_data\meme_manager\packs"
 _PACK_DATA = r"D:\AstrBot\bot\data\plugin_data\meme_manager\packs\blue-fat-fish-meme-pack\memes_data.json"
 
 
-def _pack_candidates(query: str, limit: int = 12) -> list[tuple[str, str]]:
-    """从固定表情包里按类别描述找几张，返回 [(路径, 说明)]。"""
+def _pack_candidates(query: str, limit: int = 12, strict: bool = False) -> list[tuple[str, str]]:
+    """从固定表情包里按类别描述找几张，返回 [(路径, 说明)]。strict=True 时找不到就返回空。"""
     import glob
-    q = (query or "").lower()
+    toks = _tokens(query)
     out: list[tuple[str, str]] = []
     try:
         with io.open(_PACK_DATA, encoding="utf-8-sig") as fh:
@@ -146,13 +238,17 @@ def _pack_candidates(query: str, limit: int = 12) -> list[tuple[str, str]]:
     hit_cats = []
     for cat, desc in cats.items():
         hay = (cat + " " + str(desc)).lower()
-        if q and (q in hay or any(w in hay for w in q.split())):
+        if toks and any(t in hay for t in toks):
             hit_cats.append(cat)
     for cat in hit_cats:
         for path in glob.glob(os.path.join(_PACK_ROOT, "*", "memes", cat, "*.gif"))[:4]:
             out.append((path, f"{cat}"))
         if len(out) >= limit:
             return out[:limit]
+    if hit_cats:
+        return out[:limit]
+    if strict:
+        return []
     # 没有命中就随便给几张
     for path in glob.glob(os.path.join(_PACK_ROOT, "*", "memes", "*", "*.gif"))[:limit]:
         out.append((path, os.path.basename(os.path.dirname(path))))
@@ -187,8 +283,12 @@ class MyStickers(Star):
                     path = await comp.convert_to_file_path()
                     if path and os.path.exists(path):
                         os.makedirs(_ROOT, exist_ok=True)
-                        with open(path, "rb") as src, open(_LAST, "wb") as dst:
-                            dst.write(src.read())
+                        with open(path, "rb") as src:
+                            data = src.read()
+                        with open(_LAST, "wb") as dst:
+                            dst.write(data)
+                        with open(os.path.join(_ROOT, f"last_{_sender_key(event)}.img"), "wb") as dst:
+                            dst.write(data)
                     return
         except Exception:  # noqa: BLE001
             logger.debug("sticker capture failed", exc_info=True)
@@ -201,14 +301,27 @@ class MyStickers(Star):
             desc(string): 这张图是什么，比如「戴墨镜的黑猫在草地上跑」
             tags(string): 逗号分隔的标签，比如「猫,搞笑,墨镜」
         """
-        if not os.path.exists(_LAST):
+        src_last = _last_for(event)
+        if not os.path.exists(src_last):
             return "他刚没发图，我没什么可存的。"
         try:
-            with open(_LAST, "rb") as fh:
+            if time.time() - os.path.getmtime(src_last) > 900:
+                return "刚才那张图有点久了，你重新发一次我再存。"
+            with open(src_last, "rb") as fh:
                 data = fh.read()
             if len(data) < 300:
                 return "这张太小了，存不了。"
             h = hashlib.md5(data).hexdigest()[:10]
+            items = _load()
+            old = next((it for it in items if it.get("id") == h), None)
+            if old is not None:  # 同一张图重复存：只补标签，不新增
+                merged = list(dict.fromkeys((old.get("tags") or []) + _norm(tags)))[:8]
+                old["tags"] = merged
+                if desc and len(str(old.get("desc") or "")) < len(desc):
+                    old["desc"] = desc[:80]
+                _save(items)
+                _log("save_dup", id=h, tags=merged)
+                return f"这张之前存过，标签补齐了：{'/'.join(merged)}"
             ext = ".png"
             if data[:3] == b"GIF":
                 ext = ".gif"
@@ -218,7 +331,6 @@ class MyStickers(Star):
             _ensure()
             with open(os.path.join(_ROOT, name), "wb") as fh:
                 fh.write(data)
-            items = _load()
             items.append(
                 {
                     "id": h,
@@ -229,6 +341,7 @@ class MyStickers(Star):
                 }
             )
             _save(items)
+            _log("save_new", id=h, tags=_norm(tags), desc=(desc or "")[:30])
             logger.info(f"stickers: 收了 1 张 {name} ({desc[:20]})")
             return f"收好了，我现在有 {len(items)} 张自己的表情包。"
         except Exception as exc:  # noqa: BLE001
@@ -244,15 +357,25 @@ class MyStickers(Star):
         items = _load()
         if not items:
             return "我还没有自己的表情包。"
-        q = (query or "").lower()
-        hit = None
-        for it in reversed(items):
-            hay = (it.get("desc") or "") + " " + " ".join(it.get("tags") or [])
-            if q and q in hay.lower():
-                hit = it
-                break
-        if hit is None:
-            hit = items[-1]
+        hit, score = _search(query)
+        if hit is None or score <= 0:
+            # 自己库里没有，就去固定包里找；都没有才认输，绝不瞎发
+            cands = _pack_candidates(query, strict=True)
+            if cands:
+                ppath, cat = cands[0]
+                try:
+                    await self.context.send_message(
+                        session=event.unified_msg_origin,
+                        message_chain=MessageChain([Image.fromFileSystem(ppath)]),
+                    )
+                    return f"自己库里没有，发了固定包里的（{cat}类）。"
+                except Exception as exc:  # noqa: BLE001
+                    return f"发不出去：{exc}"
+            _log("send_refused", query=query)
+            return (
+                f"库里没有跟「{query}」对得上的，固定包也没有，别硬发。"
+                "换个说法，或者让我现做一张。"
+            )
         path = os.path.join(_ROOT, hit["file"])
         if not os.path.exists(path):
             return "这张图找不到了。"
@@ -261,7 +384,9 @@ class MyStickers(Star):
                 session=event.unified_msg_origin,
                 message_chain=MessageChain([Image.fromFileSystem(path)]),
             )
-            return f"发了「{hit.get('desc','')[:20]}」。"
+            tags = "/".join(hit.get("tags") or [])
+            _log("send", query=query, id=hit.get("id"), score=score, tags=tags)
+            return f"发了「{hit.get('desc','')[:20]}」（{tags}）。"
         except Exception as exc:  # noqa: BLE001
             return f"发不出去：{exc}"
 
@@ -284,6 +409,38 @@ class MyStickers(Star):
         result = _save_last(desc, text)
         logger.info(f"stickers: 关键词存图 -> {desc[:20]}")
         yield event.plain_result(result)
+
+    @filter.regex(r"(?<![没别不想要会])使用\s*[^\s，,。！!？?、]{1,10}")
+    async def auto_use(self, event: AstrMessageEvent):
+        """「风铃使用顶飞」这种明说的，直接发，不靠模型记得调工具。
+
+        只认短命令：长句、问句、否定句里的「使用」不算，否则「我还没使用寿来呢」
+        会被当成命令，直接把回复截断成一张表情包。
+        """
+        text = (event.message_str or "").strip()
+        if len(text) > 20 or "？" in text or "?" in text:
+            return
+        m = re.search(r"(?<![没别不想要会])使用\s*([^\s，,。！!？?、]{1,10})", text)
+        if not m:
+            return
+        kw = m.group(1).strip()
+        if kw in ("技能", "表情", "表情包", "这个", "那个", "图", "一下", "它"):
+            return
+        hit, score = _search(kw)
+        if hit is None or score <= 0:
+            return  # 库里没有就交给模型/固定包去处理，别抢话
+        path = os.path.join(_ROOT, hit["file"])
+        if not os.path.exists(path):
+            return
+        logger.info(f"stickers: 关键词直发 -> {kw}（{hit.get('desc','')[:16]}）")
+        _log("auto_use", kw=kw, id=hit.get("id"), score=score)
+        _recent(f"你按他的要求发了「{kw}」那张表情")
+        event.stop_event()
+        yield event.chain_result([
+            Plain(f"{kw}～！"),
+            Image.fromFileSystem(path),
+        ])
+
 
     @filter.regex(r"用你(存|收)|发你(存|收)|把你(存|收)|你(现在)?有(的|哪些)|发你(现在)?有|发你自己的|你的表情包|发那个(表情|图)|发出来|发我看看|给我看看|看看你的|发来看看")
     async def auto_send(self, event: AstrMessageEvent):
@@ -324,26 +481,60 @@ class MyStickers(Star):
             query(string): 想表达的情绪或关键词，比如 摸鱼、害羞、笑
         """
         items = _load()
-        q = (query or "").lower()
-        for it in reversed(items):
-            hay = (it.get("desc") or "") + " " + " ".join(it.get("tags") or [])
-            if q and q in hay.lower():
-                path = os.path.join(_ROOT, it["file"])
-                if os.path.exists(path):
-                    await self.context.send_message(
-                        session=event.unified_msg_origin,
-                        message_chain=MessageChain([Image.fromFileSystem(path)]),
-                    )
-                    return f"发了一张自己存的：{it.get('desc','')[:20]}"
-        cands = _pack_candidates(query)
+        hit, score = _search(query)
+        if hit is not None and score > 0:
+            path = os.path.join(_ROOT, hit["file"])
+            if os.path.exists(path):
+                await self.context.send_message(
+                    session=event.unified_msg_origin,
+                    message_chain=MessageChain([Image.fromFileSystem(path)]),
+                )
+                return f"发了一张自己存的：{hit.get('desc','')[:20]}"
+        cands = _pack_candidates(query, strict=True)
         if not cands:
-            return "两个库里都没找到合适的。"
+            return f"两个库里都没找到跟「{query}」对得上的。"
         path, cat = cands[0]
         await self.context.send_message(
             session=event.unified_msg_origin,
             message_chain=MessageChain([Image.fromFileSystem(path)]),
         )
         return f"发了一张固定包里的（{cat}类）。"
+
+    @filter.command("表情包自检")
+    async def cmd_check(self, event: AstrMessageEvent):
+        """检查库的完整性：缺文件、重复 id、空标签、脏标签。"""
+        items = _load()
+        if not items:
+            yield event.plain_result("库里还没有表情包。")
+            return
+        missing, dup, notag, dirty = [], [], [], []
+        seen = set()
+        for it in items:
+            name = str(it.get("file") or "")
+            desc = str(it.get("desc") or "")[:14]
+            if not name or not os.path.exists(os.path.join(_ROOT, name)):
+                missing.append(desc or name or "?")
+            if it.get("id") in seen:
+                dup.append(desc)
+            seen.add(it.get("id"))
+            tags = it.get("tags") or []
+            if not tags:
+                notag.append(desc)
+            for t in tags:
+                if len(str(t)) > 8 or any(c in str(t) for c in "。！？!?~…"):
+                    dirty.append(str(t)[:12])
+        lines = [f"共 {len(items)} 张"]
+        if missing:
+            lines.append(f"缺文件 {len(missing)}：{'；'.join(missing[:3])}")
+        if dup:
+            lines.append(f"重复 id {len(dup)}：{'；'.join(dup[:3])}")
+        if notag:
+            lines.append(f"没标签 {len(notag)}：{'；'.join(notag[:3])}")
+        if dirty:
+            lines.append(f"脏标签 {len(dirty)}：{'；'.join(dirty[:3])}")
+        if not (missing or dup or notag or dirty):
+            lines.append("全项正常 ✅")
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("我的表情包")
     async def cmd_list(self, event: AstrMessageEvent):

@@ -22,18 +22,29 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 
+# 临时注入块：mark_as_temp 的内容只给模型看，不进对话历史
+try:
+    from astrbot.core.agent.message import TextPart as _TextPart
+except Exception:  # noqa: BLE001
+    _TextPart = None
+
 _DATA = Path(r"D:\AstrBot\bot\data\plugin_data\airz")
 _STATE = _DATA / "state.json"
 _ARCHIVE = _DATA / "archive.jsonl"
 _SOUL_NOTES = Path(r"D:\AstrBot\bot\data\plugin_data\dafeiyu_soul\notes.jsonl")
 
 # ---- 可调参数 ----
-MAX_TURNS = 12          # 最近保留多少轮原文（一轮 = 一问一答）
-SUMMARY_CHARS = 1200    # 摘要上限（字）
+MAX_TURNS = 6           # 最近保留多少轮原文（一轮 = 一问一答）
+TRIM_BATCH = 8          # 攒够这么多条再一次性裁，减少前缀缓存失效
+SUMMARY_CHARS = 600     # 摘要上限（字）
 TOKEN_WARN = 10000      # 注入超过这个 token 数就告警
 FUZZY_PREFIX = 26       # 模糊记忆只留前几个字
 FUZZY_MAX = 4           # 一次最多塞几条碎片
 SUMMARY_BATCH = 8       # 攒够几条被挤出去的消息才调一次模型做摘要
+
+# 我们往请求里注入的块的起始标记。AstrBot 会把拼过块的用户消息原样存回历史，
+# 下一轮再读回来——不剥掉的话每轮复制一份，历史里 98% 会变成同一段摘要的副本。
+_INJECT_MARKS = ("【更早的对话摘要】", "【模糊的记忆碎片】")
 
 _HALF_LIFE = {"普通": 30.0, "重要": 90.0, "非常重要": 3650.0}
 
@@ -58,6 +69,33 @@ def _text_of(content) -> str:
                 out.append(seg)
         return "".join(out)
     return str(content or "")
+
+
+def _strip_injected(text: str) -> str:
+    """切掉历史里上一次注入的摘要块，只留用户自己说的话。"""
+    cut = len(text)
+    for mark in _INJECT_MARKS:
+        i = text.find(mark)
+        if 0 <= i < cut:
+            cut = i
+    return text[:cut].rstrip() if cut < len(text) else text
+
+
+def _strip_content(content):
+    """字符串、分段列表都剥一遍；图片等非文本段原样保留。"""
+    if isinstance(content, str):
+        return _strip_injected(content)
+    if isinstance(content, list):
+        out = []
+        for seg in content:
+            if isinstance(seg, dict) and seg.get("type") == "text":
+                out.append(
+                    {**seg, "text": _strip_injected(str(seg.get("text") or ""))}
+                )
+            else:
+                out.append(seg)
+        return out
+    return content
 
 
 def _load_state() -> dict:
@@ -159,9 +197,9 @@ class Airz(Star):
             buf = list(state.get("buffer") or [])
 
             # 管线只保存「用过的上下文」，所以数据库里永远只有最近这一窗口。
-            # 因此不能用绝对下标做水位——每轮把超出的部分挤出去、归档、攒够再摘要。
+            # 攒够 TRIM_BATCH 条再一次性挤，避免每轮都改历史开头（那会让前缀缓存整段失效）。
             recent = history
-            if len(history) > keep:
+            if len(history) > keep + TRIM_BATCH:
                 dropped = history[: len(history) - keep]
                 if _archive(dropped):
                     buf.extend(dropped)
@@ -184,7 +222,7 @@ class Airz(Star):
                 if isinstance(m, dict) and m.get("role") == "system"
             ]
             turns = [
-                {"role": m.get("role"), "content": m.get("content")}
+                {"role": m.get("role"), "content": _strip_content(m.get("content"))}
                 for m in recent
                 if isinstance(m, dict)
                 and m.get("role") in ("user", "assistant", "system")
@@ -202,7 +240,16 @@ class Airz(Star):
                     + "\n".join(f"- {x}" for x in fuzzy)
                 )
             if add:
-                req.system_prompt = (req.system_prompt or "") + "\n\n" + "\n\n".join(add)
+                # 摘要每更新一次就变，放 system_prompt 会打断前缀缓存 → 挪到用户消息末尾；
+                # mark_as_temp 保证只跟着这一次请求，不写进对话历史。
+                block = "\n\n".join(add)
+                if _TextPart is not None:
+                    req.extra_user_content_parts.append(
+                        _TextPart(text=block).mark_as_temp()
+                    )
+                else:
+                    base = req.prompt if isinstance(req.prompt, str) else ""
+                    req.prompt = f"{base}\n\n{block}" if base else block
 
             self._audit(req, len(recent))
         except Exception:  # noqa: BLE001
@@ -214,16 +261,22 @@ class Airz(Star):
         ctx_tokens = sum(
             _tokens(_text_of(m.get("content"))) for m in (req.contexts or [])
         )
-        total = sys_tokens + ctx_tokens
+        prompt_tokens = _tokens(req.prompt) if isinstance(req.prompt, str) else 0
+        prompt_tokens += sum(
+            _tokens(getattr(p, "text", "") or "")
+            for p in (getattr(req, "extra_user_content_parts", None) or [])
+        )
+        total = sys_tokens + ctx_tokens + prompt_tokens
         if total > TOKEN_WARN:
             logger.warning(
-                f"警告：人格卡过胖，挤占当前对话注意力！"
-                f"注入合计约 {total} token（系统提示 {sys_tokens} + 对话 {ctx_tokens}），"
-                f"阈值 {TOKEN_WARN}。"
+                f"警告：上下文过胖，注意力被稀释！"
+                f"合计约 {total} token（系统提示 {sys_tokens} + 历史 {ctx_tokens}"
+                f" + 本轮 {prompt_tokens}），阈值 {TOKEN_WARN}。"
             )
         else:
             logger.debug(
-                f"airz: 上下文约 {total} token（系统 {sys_tokens} + {n_msgs} 条历史 {ctx_tokens}）"
+                f"airz: 上下文约 {total} token（系统 {sys_tokens} + "
+                f"{n_msgs} 条历史 {ctx_tokens} + 本轮 {prompt_tokens}）"
             )
 
     async def _load(self, umo: str, sender: str):
@@ -246,7 +299,8 @@ class Airz(Star):
         lines = []
         for m in messages:
             role = "他" if m.get("role") == "user" else "我"
-            text = _text_of(m.get("content")).strip()
+            # 先剥掉我们自己的注入块，免得摘要里再摘要、越滚越虚
+            text = _strip_injected(_text_of(m.get("content"))).strip()
             if text:
                 lines.append(f"{role}：{text[:200]}")
         chat = "\n".join(lines)[-4000:]

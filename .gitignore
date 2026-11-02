@@ -12,6 +12,11 @@ venv/
 plugins/astrbot_plugin_group_chat_plus/
 plugins/astrbot_plugin_meme_manager/
 
+# ---- DSH 插件（第三方包 + 运行时，不入库）----
+dsh/dsh-tts-bridge/
+dsh/bin/
+dsh/uv-tools/
+
 # ---- Python 产物 ----
 __pycache__/
 *.py[cod]

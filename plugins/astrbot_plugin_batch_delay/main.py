@@ -27,6 +27,9 @@ class BatchDelay(Star):
                 return
             if event.is_group_message():
                 return
+            # 已经被 private_debounce 合并过（它已经等过了），别再叠 4 秒
+            if event.get_extra("_think_pause_done"):
+                return
             # 只对真人消息生效，命令不延迟
             text = (event.message_str or "").strip()
             if text.startswith("/"):

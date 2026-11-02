@@ -14,6 +14,7 @@ AstrBot 只在「LLM 跑过」的那一轮写历史，下面两条路都不会�
 from __future__ import annotations
 
 import json
+import re
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -21,6 +22,11 @@ from astrbot.api.star import Context, Star, register
 
 _MAX_LEN = 300  # 单条最多记多少字，免得命令的整屏输出把上下文撑爆
 _OUTGOING_LOG = r"D:\AstrBot\recent-outgoing.jsonl"
+
+
+def _norm(s: str) -> str:
+    """去掉所有空白再比，分段回复会把换行变成空格，直接比字符串会误判成新消息。"""
+    return re.sub(r"\s+", "", s or "")
 
 
 def _plain(msg: dict) -> str:
@@ -84,7 +90,8 @@ class HistoryBridge(Star):
             chain = getattr(res, "chain", None) if res else None
             if not chain:
                 return
-            text = (chain.get_plain_text() or "").strip()
+            # res.chain 是 list[组件]，不是 MessageChain：get_plain_text() 要从 res 上取
+            text = (res.get_plain_text() or "").strip()
             if not text:
                 return
             umo = event.unified_msg_origin
@@ -92,8 +99,12 @@ class HistoryBridge(Star):
             if not got:
                 return
             cid, history = got
-            if history and history[-1].get("role") == "assistant" and _plain(history[-1]) == text:
-                return  # LLM 那边已经记过了
+            # 管线（或 group_chat_plus）可能已经记过这句了。分段回复会把换行变成空格，
+            # 所以按「去掉所有空白」比对最近几条 assistant，别只看最后一条。
+            if _norm(text) in [
+                _norm(_plain(m)) for m in history[-6:] if m.get("role") == "assistant"
+            ]:
+                return
             user = (event.message_str or "").strip()
             if user:
                 history.append({"role": "user", "content": user[:200]})

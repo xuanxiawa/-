@@ -26,6 +26,12 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.message_components import Plain
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
+# 临时注入块：mark_as_temp 的内容只给模型看，不进对话历史
+try:
+    from astrbot.core.agent.message import TextPart as _TextPart
+except Exception:  # noqa: BLE001
+    _TextPart = None
+
 _DATA = os.path.join(get_astrbot_plugin_data_path(), "heart")
 _STATE = os.path.join(_DATA, "state.json")
 _DIARY = os.path.join(_DATA, "diary.jsonl")
@@ -33,6 +39,40 @@ _UMO = os.path.join(_DATA, "umo.txt")
 _MD = os.path.join(_DATA, "日记.md")
 _FAV_MD = os.path.join(_DATA, "好感度.md")
 _DB = r"D:\AstrBot\bot\data\data_v4.db"
+
+# 注入预算：和 soul / shared_brain 共用同一本账（模块在隔壁 soul 插件目录里）
+try:
+    import importlib.util as _ilu
+
+    _spec = _ilu.spec_from_file_location(
+        "dafeiyu_prompt_budget",
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "astrbot_plugin_dafeiyu_soul",
+            "prompt_budget.py",
+        ),
+    )
+    _budget = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_budget)
+except Exception:  # noqa: BLE001
+    _budget = None
+    logger.warning("heart: 注入预算模块没加载上，本次不做总量约束", exc_info=True)
+
+# 心情/精力内核：和 soul 共用同一套曲线，避免两个插件各算各的
+try:
+    _spec = _ilu.spec_from_file_location(
+        "dafeiyu_mood_core",
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "astrbot_plugin_dafeiyu_soul",
+            "mood_core.py",
+        ),
+    )
+    _mood = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mood)
+except Exception:  # noqa: BLE001
+    _mood = None
+    logger.warning("heart: 心情内核没加载上，退回旧的精力算法", exc_info=True)
 
 MOODS = ["兴奋", "开心", "平静", "无聊", "闷闷的", "有点难过", "委屈", "生气", "困", "黏人"]
 SAD_WORDS = ["累", "难受", "自卑", "没用", "废", "想哭", "烦", "压力", "焦虑", "难过", "emo", "不想活", "撑不住"]
@@ -223,13 +263,31 @@ def _write_fav_file(s: dict) -> None:
         pass
 
 
+def _idle_hours(s: dict) -> float:
+    """多久没互动了：他说话、她回话都算。
+
+    以前只用 last_user_ts：他刚在群里聊完，私聊这边却算成「20 小时没理我」，
+    心情会误判成「黏人」；状态还没初始化时（0）更会被算成几万小时。
+    """
+    last = max(_num(s.get("last_user_ts"), 0.0), _num(s.get("last_bot_ts"), 0.0))
+    if not last:
+        return 0.0
+    return max(0.0, (time.time() - last) / 3600.0)
+
+
 def _mood_label(s: dict, low: str = "") -> str:
-    """把分数 + 精力 + 多久没说话，合成一个具体心情。"""
-    score = float(s.get("mood_score") or 0.6)
+    """把分数 + 精力 + 几点 + 多久没说话，合成一个具体心情（规则在 mood_core）。"""
+    now = datetime.now()
+    hour = now.hour + now.minute / 60.0
+    idle_h = _idle_hours(s)
+    angry = any(w in (low or "") for w in ANGRY_WORDS)
+    score = _num(s.get("mood_score"), 0.6)
     energy = _num(s.get("energy"), 0.75)
-    now = time.time()
-    idle_h = (now - float(s.get("last_user_ts") or now)) / 3600.0
-    if any(w in low for w in ANGRY_WORDS) or score < 0.22:
+    if _mood is not None:
+        return _mood.mood_label(score, energy, idle_h, hour, angry)
+
+    # 兜底：内核没加载上时用旧规则（保证插件还能跑）
+    if angry or score < 0.22:
         return "生气"
     if energy < 0.22:
         return "困"
@@ -251,49 +309,88 @@ def _mood_label(s: dict, low: str = "") -> str:
 
 
 def _recover_energy(s: dict) -> dict:
-    """闲着会回血：睡觉时段快，白天慢；聊得越勤越不回。"""
+    """精力往「这个时段的基线」靠：聊着几乎不回，闲着慢慢回，睡着回得快。"""
     now = time.time()
     last = float(s.get("last_energy_ts") or 0)
+    now_dt = datetime.now()
+    hour = now_dt.hour + now_dt.minute / 60.0
     if not last:
         s["last_energy_ts"] = now
+        if _mood is not None:
+            s["energy"] = _mood.energy_target(hour)
         return s
     hours = max(0.0, min(24.0, (now - last) / 3600.0))
-    if hours < 0.2:
+    if hours < 0.02:
         return s
-    idle_h = (now - float(s.get("last_user_ts") or now)) / 3600.0
-    hour = datetime.now().hour
-    night = hour < 7 or hour >= 23
-    if night and idle_h >= 0.5:
-        rate = 0.9   # 睡觉：一小时回 9 成
-    elif idle_h >= 1.0:
-        rate = 0.10  # 白天闲着：慢一点
+    idle_h = _idle_hours(s)
+    energy = _num(s.get("energy"), 0.75)
+    if _mood is not None:
+        s["energy"] = _mood.tick(energy, hours, hour, idle_h)
     else:
-        rate = 0.0   # 聊得正热，不回血
-    if rate:
-        s["energy"] = max(0.05, min(1.0, _num(s.get("energy"), 0.75) + hours * rate))
-        s["last_energy_ts"] = now
+        # 兜底：旧算法
+        night = hour < 7 or hour >= 23
+        if night and idle_h >= 0.5:
+            rate = 0.9
+        elif idle_h >= 1.0:
+            rate = 0.10
+        else:
+            rate = 0.0
+        if rate:
+            s["energy"] = max(0.05, min(1.0, energy + hours * rate))
+    s["last_energy_ts"] = now
     return s
 
 
-def _update_mood(s: dict, text: str) -> dict:
+PRAISE_WORDS = ["可爱", "好看", "乖", "厉害", "喜欢你", "想你了", "贴贴", "抱抱", "摸摸", "棒", "漂亮"]
+
+
+def _update_mood(s: dict, text: str, idle_h: float | None = None) -> dict:
+    """把这一轮发生的事记成「情绪事件」，再由还活着的事件合成分数。
+
+    idle_h 要在「把 last_user_ts 改成现在」之前算好传进来，否则永远是 0：
+    以前就是这么错的——「被晾三小时」从来没生效，连聊 streak 也从来不清零。
+    """
     low = (text or "").lower()
-    score = float(s.get("mood_score") or 0.6)
+    now = time.time()
+    if idle_h is None:
+        idle_h = _idle_hours(s)
+    src = (text or "").strip()[:60]
+
+    # 1) 关键词事件：每件事各自记一条，各自衰减
     if any(w in low for w in ANGRY_WORDS):
-        score -= 0.20
+        _emotion_append("被凶", -0.20, 12, "他刚才语气很冲", src)
     if any(w in low for w in SAD_WORDS):
-        score -= 0.08
+        _emotion_append("心疼", -0.08, 10, "他说了难受的话", src)
     if any(w in low for w in HAPPY_WORDS):
-        score += 0.10
+        _emotion_append("开心", 0.10, 6, "他说了好玩的话", src)
+    elif any(w in low for w in PRAISE_WORDS):
+        _emotion_append("被夸", 0.06, 6, "被夸了", src)
     if any(w in low for w in EXCITED_WORDS):
-        score += 0.12
+        _emotion_append("兴奋", 0.12, 6, "聊到兴头上", src)
     if any(w in low for w in BORED_WORDS):
-        score -= 0.05
+        _emotion_append("无聊", -0.05, 3, "他说没意思", src)
     if any(w in low for w in CLINGY_WORDS):
-        score += 0.05
+        _emotion_append("心软", 0.05, 6, "他说想我", src)
     if any(w in low for w in TIRED_WORDS):
-        score -= 0.04
-    score += (0.6 - score) * 0.05  # 慢慢回落到基线
-    s["mood_score"] = max(0.02, min(1.0, score))
+        _emotion_append("心疼", -0.04, 3, "他困了/累了", src)
+
+    # 2) 互动质量
+    stripped = (text or "").strip()
+    if 0 < len(stripped) <= 3 and not any(c in stripped for c in ("?", "？")):
+        _emotion_append("被敷衍", -0.03, 2, "只回了两三个字", src)
+    if datetime.now().hour < 5:
+        _emotion_append("深夜陪伴", 0.03, 8, "深夜还陪着聊", src)
+    if idle_h >= 3:
+        _emotion_append("被晾", -0.06, 4, f"他 {idle_h:.0f} 小时没说话", src)
+    streak = int(_num(s.get("chat_streak"), 0))
+    streak = streak + 1 if idle_h < 0.5 else 1
+    s["chat_streak"] = streak
+    if streak % 10 == 0:
+        _emotion_append("有点累", -0.04, 2, "连着聊了十轮", src)
+
+    s["last_mood_ts"] = now
+    s["mood_score"] = round(_emotion_score(now), 3)
+    s["mood_why"] = _emotion_why()
     s["mood"] = _mood_label(s, low)
     return s
 
@@ -424,6 +521,9 @@ def _recent_take(hours: float = 1.2) -> list[dict]:
 
 
 _SELF = os.path.join(_DATA, "self.json")
+# 情绪事件本：一条消息最多落几条事件，情绪由「还活着的事件」合成，不再直接改一个分数
+_EMOTIONS = os.path.join(_DATA, "emotions.jsonl")
+EMO_BASELINE = 0.6
 
 
 def _load_self() -> dict:
@@ -449,6 +549,90 @@ def _save_self(d: dict) -> None:
             json.dump(d, fh, ensure_ascii=False, indent=2)
     except Exception:  # noqa: BLE001
         pass
+
+
+# ---------- 情绪事件（M1） ----------
+# 一条消息可能同时触发好几件事（被夸 + 深夜陪伴），每件事各自衰减；
+# 当前情绪 = 基线 0.6 + 还活着的事件之和。这样「为什么闷」能一条条列出来。
+
+def _emotion_append(kind: str, strength: float, half_life_h: float, why: str, src: str = "") -> None:
+    try:
+        _ensure()
+        row = {
+            "ts": round(time.time(), 1),
+            "kind": kind,
+            "s": round(float(strength), 3),
+            "hl": float(half_life_h),
+            "why": str(why or kind)[:40],
+            "src": str(src or "")[:60],
+        }
+        with io.open(_EMOTIONS, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        # 文件太大就压一次，只留最近 400 条
+        try:
+            if os.path.getsize(_EMOTIONS) > 200_000:
+                lines = io.open(_EMOTIONS, encoding="utf-8").read().splitlines()[-400:]
+                io.open(_EMOTIONS, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001
+        logger.debug("emotion append failed", exc_info=True)
+
+
+def _emotion_read(hours: float = 96.0) -> list[dict]:
+    cutoff = time.time() - hours * 3600
+    out: list[dict] = []
+    try:
+        with io.open(_EMOTIONS, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if float(e.get("ts") or 0) >= cutoff:
+                    out.append(e)
+    except FileNotFoundError:
+        pass
+    except Exception:  # noqa: BLE001
+        logger.debug("emotion read failed", exc_info=True)
+    return out
+
+
+def _emotion_effective(e: dict, now: float | None = None) -> float:
+    now = now or time.time()
+    age_h = max(0.0, (now - float(e.get("ts") or now)) / 3600.0)
+    hl = max(0.5, float(e.get("hl") or 6.0))
+    return float(e.get("s") or 0.0) * (0.5 ** (age_h / hl))
+
+
+def _emotion_score(now: float | None = None) -> float:
+    now = now or time.time()
+    total = sum(_emotion_effective(e, now) for e in _emotion_read())
+    return max(0.02, min(1.0, EMO_BASELINE + total))
+
+
+def _emotion_why(n: int = 3) -> list[str]:
+    """还在起作用的前几条情绪，给 /心情 解释用。"""
+    now = time.time()
+    scored = []
+    for e in _emotion_read():
+        eff = _emotion_effective(e, now)
+        if abs(eff) >= 0.01:
+            scored.append((abs(eff), eff, e))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out = []
+    for _, eff, e in scored[:n]:
+        try:
+            t = datetime.fromtimestamp(float(e.get("ts") or 0)).strftime("%H:%M")
+        except Exception:  # noqa: BLE001
+            t = "--:--"
+        out.append(
+            f"{t} {e.get('kind') or '情绪'}：{e.get('why') or ''} {eff:+.2f}"
+        )
+    return out
 
 _HEART_DELTA = r"D:\AstrBot\heart-delta.json"
 
@@ -544,10 +728,18 @@ class Heart(Star):
             _recent_append("他", text)
             s = _state()
             s = _recover_energy(s)
+            prev_ts = _num(s.get("last_user_ts"), 0.0)
+            idle_before = (time.time() - prev_ts) / 3600.0 if prev_ts else 0.0
             s["last_user_ts"] = time.time()
             s["msg_count"] = int(s.get("msg_count") or 0) + 1
-            s["energy"] = max(0.05, _num(s.get("energy"), 0.75) - 0.012)
-            s = _update_mood(s, text)
+            _now = datetime.now()
+            _hour = _now.hour + _now.minute / 60.0
+            s["energy"] = (
+                _mood.drain(_num(s.get("energy"), 0.75), text, _hour)
+                if _mood is not None
+                else max(0.05, _num(s.get("energy"), 0.75) - 0.002)
+            )
+            s = _update_mood(s, text, idle_h=idle_before)
             if s["msg_count"] % 8 == 0:
                 s = _add_favor(s, 1.0)
             if s["mood"] == "开心":
@@ -562,6 +754,10 @@ class Heart(Star):
         try:
             _apply_heart_delta()
             s = _recover_energy(_state())
+            # 每次请求都把心情名按「当前精力 + 几点」重算一遍，
+            # 免得存着的是三小时前那个「困」；顺便刷新"为什么"给 /心情 看
+            s["mood"] = _mood_label(s)
+            s["mood_why"] = _emotion_why()
             _save(_STATE, s)
             lv = _favor_level(s["favor"])
             diary = _fresh_diary()[-2:]
@@ -582,8 +778,8 @@ class Heart(Star):
             if hint:
                 block.append(f"- {hint}")
             e = _num(s.get("energy"), 0.75)
-            if e < 0.35:
-                block.append("- 你有点累了，说话更短更懒（**这是可以直接说出来的**：累、困）")
+            if e < 0.28:
+                block.append("- 你有点乏了：句子短一点、懒一点，但别主动说自己困，除非已经很晚了")
             elif e > 0.85:
                 block.append("- 你精神很好，话多一点、愿意闹")
             idle_h = (time.time() - float(s.get("last_user_ts") or 0)) / 3600.0
@@ -628,7 +824,22 @@ class Heart(Star):
                 me_lines.append("- 你今天有点提不起劲，可以少说几句，也可以直接说「今天不想」")
             if len(me_lines) > 1:
                 block.append("\n".join(me_lines))
-            req.system_prompt = (req.system_prompt or "") + "\n\n" + "\n".join(block)
+            text_block = "\n".join(block)
+            if _budget is not None:
+                text_block = _budget.offer(req, "heart", text_block, audit_dir=_DATA)
+            if not text_block:
+                return
+            # 挂到用户消息尾部而不是系统提示：系统提示是缓存前缀，这块每轮都在变
+            # （心情/好感/刚说过的话），放前面会把后面的整段历史一起作废。
+            # 但要用 mark_as_temp：框架会把发给模型的消息原样存进历史，
+            # 直接写 req.prompt 会让这块每轮都永久留在历史里。
+            if _TextPart is not None:
+                req.extra_user_content_parts.append(
+                    _TextPart(text=text_block).mark_as_temp()
+                )
+            else:
+                base = req.prompt if isinstance(req.prompt, str) and req.prompt else ""
+                req.prompt = f"{base}\n\n{text_block}" if base else text_block
         except Exception:  # noqa: BLE001
             pass
 

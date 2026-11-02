@@ -1,0 +1,331 @@
+{
+  "engine": {
+    "description": "合成后端",
+    "type": "string",
+    "default": "gsv",
+    "options": [
+      "gsv",
+      "edge"
+    ],
+    "hint": "gsv=本地 GPT-SoVITS 克隆音色（才羽桃井，要先起 api_v2.py，CPU 上一句 10~30 秒）；edge=微软 Edge 免费语音（1~2 秒，但不是她的声音），只在 GSV 挂了时当兜底"
+  },
+  "gsv": {
+    "description": "GPT-SoVITS（才羽桃井音色）",
+    "type": "object",
+    "items": {
+      "api_base": {
+        "description": "服务地址",
+        "type": "string",
+        "default": "http://127.0.0.1:9880"
+      },
+      "refer_wav": {
+        "description": "参考音频",
+        "type": "string",
+        "default": "D:\\AstrBot\\voice\\momoi_ref.wav",
+        "hint": "才羽桃井的中配语音（kivo.wiki 第 56 条 lobby「老师，你快看！这里面的图章…」，5.2 秒）"
+      },
+      "prompt_text": {
+        "description": "参考音频的原话",
+        "type": "text",
+        "default": "老师，你快看！这里面的图章，我已经全部都盖满啦！",
+        "hint": "必须和参考音频逐字一致；改了 refer_wav 就要一起改这句"
+      },
+      "prompt_lang": {
+        "description": "参考音频语言",
+        "type": "string",
+        "default": "zh",
+        "options": [
+          "zh",
+          "en",
+          "ja",
+          "yue"
+        ]
+      },
+      "text_lang": {
+        "description": "合成语言",
+        "type": "string",
+        "default": "auto",
+        "options": [
+          "auto",
+          "zh",
+          "en",
+          "ja",
+          "yue"
+        ]
+      },
+      "speed": {
+        "description": "基础语速",
+        "type": "float",
+        "default": 1.0,
+        "slider": {
+          "min": 0.6,
+          "max": 1.5,
+          "step": 0.02
+        },
+        "hint": "实际语速 = 这个 × 心情系数（见「心情语音」里的说明）"
+      },
+      "split_method": {
+        "description": "切分方式",
+        "type": "string",
+        "default": "cut0",
+        "options": [
+          "cut0",
+          "cut1",
+          "cut2",
+          "cut3",
+          "cut4",
+          "cut5"
+        ]
+      },
+      "min_chunk_length": {
+        "description": "最小块长",
+        "type": "int",
+        "default": 16
+      },
+      "overlap_length": {
+        "description": "交界重复字数",
+        "type": "int",
+        "default": 0
+      },
+      "top_k": {
+        "description": "top_k",
+        "type": "int",
+        "default": 15
+      },
+      "top_p": {
+        "description": "top_p",
+        "type": "float",
+        "default": 1.0
+      },
+      "temperature": {
+        "description": "temperature",
+        "type": "float",
+        "default": 1.0
+      },
+      "fragment_interval": {
+        "description": "分段间隔（秒）",
+        "type": "float",
+        "default": 0.0
+      },
+      "gpt_weights": {
+        "description": "GPT 微调权重（可空）",
+        "type": "string",
+        "default": ""
+      },
+      "sovits_weights": {
+        "description": "SoVITS 微调权重（可空）",
+        "type": "string",
+        "default": ""
+      },
+      "timeout": {
+        "description": "单次请求超时（秒）",
+        "type": "int",
+        "default": 300,
+        "hint": "纯 CPU 出句慢，别设太小"
+      }
+    }
+  },
+  "edge": {
+    "description": "Edge TTS（兜底）",
+    "type": "object",
+    "items": {
+      "voice": {
+        "description": "音色",
+        "type": "string",
+        "default": "zh-CN-XiaoyiNeural"
+      },
+      "rate": {
+        "description": "语速",
+        "type": "string",
+        "default": "+0%"
+      },
+      "volume": {
+        "description": "音量",
+        "type": "string",
+        "default": "+0%"
+      },
+      "pitch": {
+        "description": "音调",
+        "type": "string",
+        "default": "+0Hz"
+      },
+      "ffmpeg": {
+        "description": "ffmpeg 路径",
+        "type": "string",
+        "default": "D:\\大肥鱼\\插件\\ffmpeg\\bin\\ffmpeg.exe"
+      }
+    }
+  },
+  "mood": {
+    "description": "心情语音（不再按概率）",
+    "type": "object",
+    "hint": "发不发语音由 heart 插件的心情决定：兴奋/开心/黏人=必发（语速 1.08/1.03/0.97）；委屈/有点难过/闷闷的=发（语速 0.88~0.92）；无聊=很久才一句；平静/生气/困=只打字。兴奋且冷却到点会突然念唱两句",
+    "items": {
+      "enable": {
+        "description": "启用心情驱动",
+        "type": "bool",
+        "default": true
+      },
+      "state_file": {
+        "description": "心情文件",
+        "type": "string",
+        "default": "D:\\AstrBot\\bot\\data\\plugin_data\\heart\\state.json",
+        "hint": "heart 插件写、这里只读。换了插件目录要跟着改"
+      },
+      "min_interval": {
+        "description": "最短间隔（秒）",
+        "type": "int",
+        "default": 90,
+        "hint": "同一会话两条语音之间至少隔这么久（对讲窗口内不受限）"
+      },
+      "min_chars": {
+        "description": "最短字数",
+        "type": "int",
+        "default": 2
+      },
+      "max_chars": {
+        "description": "最长字数",
+        "type": "int",
+        "default": 30,
+        "hint": "CPU 上 60 字要 30 秒以上，别调太大"
+      },
+      "synth_timeout": {
+        "description": "合成超时（秒）",
+        "type": "int",
+        "default": 60,
+        "hint": "超过就直接发文字，不让消息卡死"
+      }
+    }
+  },
+  "intercom": {
+    "description": "语音对讲",
+    "type": "object",
+    "items": {
+      "enable": {
+        "description": "启用",
+        "type": "bool",
+        "default": true
+      },
+      "private_only": {
+        "description": "只在私聊生效",
+        "type": "bool",
+        "default": true
+      },
+      "hold_seconds": {
+        "description": "窗口时长（秒）",
+        "type": "int",
+        "default": 180
+      },
+      "min_chars": {
+        "description": "转写最短字数",
+        "type": "int",
+        "default": 1
+      },
+      "max_chars": {
+        "description": "单条最长字数",
+        "type": "int",
+        "default": 60
+      }
+    }
+  },
+  "command": {
+    "description": "/tts 点播",
+    "type": "object",
+    "items": {
+      "admin_only": {
+        "description": "只有管理员能用",
+        "type": "bool",
+        "default": false
+      }
+    }
+  },
+  "tool": {
+    "description": "LLM 自主调用",
+    "type": "object",
+    "items": {
+      "enable": {
+        "description": "允许模型自己决定发语音",
+        "type": "bool",
+        "default": true,
+        "hint": "困/生气时工具会拒绝，让她保持安静"
+      }
+    }
+  },
+  "song": {
+    "description": "念唱（带词库）",
+    "type": "object",
+    "hint": "不是真唱歌：用她自己的声音把歌词念出来，压低语速、拉长尾音，图的是司凤版那种跑调感。兴奋时会自动挑一首；也可以 /唱歌 手动点",
+    "items": {
+      "enable": {
+        "description": "启用",
+        "type": "bool",
+        "default": true
+      },
+      "cooldown": {
+        "description": "自动唱歌冷却（秒）",
+        "type": "int",
+        "default": 1200,
+        "hint": "同一会话两次自动念唱之间至少隔这么久"
+      },
+      "max_reply_chars": {
+        "description": "触发条件：当时回复不超过多少字",
+        "type": "int",
+        "default": 20,
+        "hint": "她正在讲长内容时不要突然开唱"
+      },
+      "speed": {
+        "description": "念唱语速",
+        "type": "float",
+        "default": 0.88,
+        "slider": {
+          "min": 0.6,
+          "max": 1.2,
+          "step": 0.02
+        },
+        "hint": "比说话慢一点才像在哼"
+      },
+      "timeout": {
+        "description": "念唱合成超时（秒）",
+        "type": "int",
+        "default": 180,
+        "hint": "歌词比一句话长，CPU 上要更久"
+      },
+      "lines": {
+        "description": "曲库（一行一首：歌名|歌词）",
+        "type": "text",
+        "default": "雨爱（司凤版）|邦吧邦吧邦吧～ 雨爱～ 帮吧帮吧帮吧～\n学猫叫|我们一起学猫叫，一起喵喵喵喵喵～\n虫儿飞|黑黑的天空低垂，亮亮的繁星相随～\n小星星|一闪一闪亮晶晶，满天都是小星星～",
+        "hint": "留空就用插件内置的那四首。想加歌直接加一行，歌词别太长（CPU 上 20 字约 30 秒）"
+      },
+      "learn_enable": {
+        "description": "允许她自己学新歌（每周最多一首）",
+        "type": "bool",
+        "default": true,
+        "hint": "歌词来自网易云公开接口；只存词，不下音频"
+      },
+      "learn_interval_days": {
+        "description": "学歌间隔（天）",
+        "type": "int",
+        "default": 7,
+        "hint": "距离上次学歌至少过这么多天，才会再自动学一首"
+      },
+      "max_songs": {
+        "description": "曲库上限（首）",
+        "type": "int",
+        "default": 40,
+        "hint": "学来的歌 + 配置里写的，超过就不再学"
+      },
+      "max_lyric_chars": {
+        "description": "一首歌念多少字",
+        "type": "int",
+        "default": 40,
+        "hint": "CPU 上 40 字要 40 秒左右，别调太大"
+      },
+      "library_file": {
+        "description": "学歌存档路径",
+        "type": "string",
+        "default": "",
+        "hint": "留空 = data/plugin_data/voice/learned_songs.json"
+      }
+    }
+  }
+}

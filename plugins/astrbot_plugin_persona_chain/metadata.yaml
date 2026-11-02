@@ -1,0 +1,7 @@
+name: astrbot_plugin_persona_chain
+display_name: 大肥鱼的人格版本链
+desc: 她提草稿、主人批准、可回滚；每条带依据，红线她自己删不掉
+version: 1.0.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"

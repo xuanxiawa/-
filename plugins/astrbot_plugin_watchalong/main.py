@@ -14,6 +14,7 @@ import ctypes
 import io
 import json
 import os
+import re
 import time
 from ctypes import wintypes
 from datetime import datetime
@@ -27,6 +28,7 @@ from astrbot.core.message.message_event_result import MessageChain
 _VISION_CFG = r"D:\AstrBot\bot\data\config\astrbot_plugin_screen_eye_config.json"
 _STATE = r"D:\AstrBot\watching.json"
 _RECENT_WATCH = r"D:\AstrBot\watching-recent.jsonl"
+_RECOMMENDED = r"D:\AstrBot\bili-recommended.jsonl"
 _UMO = r"D:\AstrBot\watch-last-umo.txt"
 _LOG = r"D:\AstrBot\watchalong.log"
 
@@ -55,32 +57,46 @@ def _log(msg: str) -> None:
         pass
 
 
-def foreground_window() -> tuple[int, str, str]:
-    """返回 (hwnd, 标题, 进程名)。"""
+def foreground_window() -> tuple[int, str, str, str]:
+    """返回 (hwnd, 标题, 进程名, 进程完整路径)。"""
     hwnd = _u.GetForegroundWindow()
     buf = ctypes.create_unicode_buffer(512)
     _u.GetWindowTextW(hwnd, buf, 512)
     pid = wintypes.DWORD()
     _u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     pname = ""
+    exe = ""
     try:
         import psutil
 
-        pname = psutil.Process(pid.value).name()
+        proc = psutil.Process(pid.value)
+        pname = proc.name()
+        exe = proc.exe() or ""
     except Exception:  # noqa: BLE001
-        pname = ""
-    return hwnd, (buf.value or ""), pname
+        pass
+    return hwnd, (buf.value or ""), pname, exe
 
 
-def is_bili(title: str, pname: str) -> bool:
+def is_offscreen(hwnd) -> bool:
+    """窗口完全在屏幕外（比如她自己的离屏浏览器）。"""
+    r = wintypes.RECT()
+    _u.GetWindowRect(hwnd, ctypes.byref(r))
+    return r.left <= -4000 or r.top <= -4000
+
+
+def is_bili(title: str, pname: str, exe: str = "") -> bool:
     """只有真的在看 B 站才算。
 
     - B 站客户端：进程名是 哔哩哔哩.exe
     - 网页：标题里必须带 B 站的站点后缀（哔哩哔哩 / _bilibili），
       光出现 "bilibili" 几个字不算（比如某个会话就叫「Bilibili 视频链接」）
+    - 她自己的 Playwright 浏览器不算：那是她在刷，不是主人在看
     """
     low_title = (title or "").lower()
     low_name = (pname or "").lower()
+    low_exe = (exe or "").lower()
+    if "ms-playwright" in low_exe or "browser-profile" in low_exe:
+        return False
     if "deepseek harness" in low_title:
         return False
     if "哔哩哔哩" in low_name or "bilibili" in low_name:
@@ -91,6 +107,33 @@ def is_bili(title: str, pname: str) -> bool:
     if "_bilibili" in low_title or "-bilibili" in low_title:
         return True
     return False
+
+
+def _norm_title(title: str) -> str:
+    return re.sub(r"[^\w\u4e00-\u9fff]", "", (title or "").lower())
+
+
+def _recommended_from(title: str) -> dict | None:
+    """这部是不是她之前主动安利过的（标题模糊匹配）。"""
+    import difflib
+
+    key = _norm_title(title)
+    if len(key) < 6:
+        return None
+    try:
+        with io.open(_RECOMMENDED, encoding="utf-8") as fh:
+            rows = [json.loads(line) for line in fh if line.strip()]
+    except Exception:  # noqa: BLE001
+        return None
+    for rec in reversed(rows[-50:]):
+        rt = _norm_title(rec.get("title", ""))
+        if not rt:
+            continue
+        if key in rt or rt in key:
+            return rec
+        if difflib.SequenceMatcher(None, key, rt).ratio() >= 0.72:
+            return rec
+    return None
 
 
 def capture(hwnd):
@@ -227,7 +270,11 @@ class WatchAlong(Star):
                 pass
             if not items:
                 s = load_state()
-                if s.get("title") and time.time() - float(s.get("ts") or 0) <= 7200:
+                if (
+                    s.get("title")
+                    and s.get("from") != "browser_bili"  # 那是她自己刷的，不是主人屏幕
+                    and time.time() - float(s.get("ts") or 0) <= 7200
+                ):
                     items = [s]
             if not items:
                 return
@@ -235,7 +282,9 @@ class WatchAlong(Star):
             for it in items[-3:]:
                 ts = datetime.fromtimestamp(float(it.get("ts") or 0)).strftime("%H:%M")
                 fact = (it.get("detail") or it.get("scene") or "").strip()[:60]
-                lines.append(f"- {ts} 《{it.get('title','')}》" + (f"（你看到的：{fact}）" if fact else ""))
+                rec = _recommended_from(it.get("title", ""))
+                mark = "（这部是你之前安利给他的）" if rec else ""
+                lines.append(f"- {ts} 《{it.get('title','')}》{mark}" + (f"（你看到的：{fact}）" if fact else ""))
             block = (
                 "【你最近在主人屏幕上看到的视频】（只是背景，不一定都在聊）\n"
                 + "\n".join(lines)
@@ -254,8 +303,8 @@ class WatchAlong(Star):
         while True:
             try:
                 await asyncio.sleep(60)
-                hwnd, title, pname = foreground_window()
-                if not is_bili(title, pname):
+                hwnd, title, pname, exe = foreground_window()
+                if is_offscreen(hwnd) or not is_bili(title, pname, exe):
                     stable = 0
                     last_seen_title = ""
                     continue
@@ -360,6 +409,12 @@ class WatchAlong(Star):
                     "总共 60 字以内，可以分两三句。不要只喊情绪不交代对象（比如只说『这画面离谱呀』），"
                     "不要说『好看吗』『我也跟着看会儿』。只输出消息本身。"
                 )
+                rec = _recommended_from(title)
+                if rec:
+                    prompt += (
+                        f"\n补充：这部《{rec.get('title')}》是你之前主动安利给他的，"
+                        "他真去看了——认出来，用「你终于看我安利的那部了」这个意思接，别装不认识。"
+                    )
                 resp = await provider.text_chat(prompt=prompt)
                 text = (getattr(resp, "completion_text", "") or "").strip().strip('"「」')
         except Exception:  # noqa: BLE001

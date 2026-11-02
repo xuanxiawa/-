@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -29,6 +30,12 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 
+# 临时注入块：mark_as_temp 的内容只给模型看，不进对话历史
+try:
+    from astrbot.core.agent.message import TextPart as _TextPart
+except Exception:  # noqa: BLE001
+    _TextPart = None
+
 try:
     from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
@@ -39,7 +46,49 @@ except Exception:  # noqa: BLE001
 _DIR = _DATA_BASE / "dafeiyu_soul"
 _STATE = _DIR / "state.json"
 _MEMES = _DIR / "memes_learned.json"
+# 笔记分三份存：
+#   notes.jsonl          普通 / 重要，有活跃上限，超了按权重淘汰（进归档，不删）
+#   durable.jsonl        非常重要，不参与淘汰（以前混在 notes.jsonl 里，会被 FIFO 顶掉）
+#   notes_archive.jsonl  被修订 / 合并 / 过期 / 淘汰的，留着溯源，不参与召回
 _NOTES = _DIR / "notes.jsonl"
+_DURABLE = _DIR / "durable.jsonl"
+_ARCHIVE = _DIR / "notes_archive.jsonl"
+
+_NOTES_CAP = 400        # 普通+重要 的活跃条数上限（原先是 200，且是先进先出）
+_DURABLE_CAP = 800      # 非常重要 不淘汰，只防无限增长
+_ARCHIVE_CAP = 1000     # 归档留最近这么多条，够回溯就行
+
+# 兴趣画像（I1）：她喜欢/不喜欢什么，带证据，会随时间和提及次数变化
+_INTERESTS = _DIR / "interests.jsonl"
+_INTERESTS_ARCHIVE = _DIR / "interests_archive.jsonl"
+_INTERESTS_CAP = 60
+_INTEREST_HALF_LIFE = 30.0   # 天：一个月没提，兴趣淡一半
+
+# 注入预算：三家插件共用一本账（同一目录下的 prompt_budget.py）
+try:
+    import importlib.util as _ilu
+
+    _spec = _ilu.spec_from_file_location(
+        "dafeiyu_prompt_budget", Path(__file__).with_name("prompt_budget.py")
+    )
+    _budget = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_budget)
+except Exception:  # noqa: BLE001
+    _budget = None
+    logger.warning("注入预算模块没加载上，注入不做总量约束", exc_info=True)
+
+# 心情/精力内核：和 heart 共用同一套曲线
+try:
+    import importlib.util as _ilu2
+
+    _spec2 = _ilu2.spec_from_file_location(
+        "dafeiyu_mood_core", Path(__file__).with_name("mood_core.py")
+    )
+    _mood = _ilu2.module_from_spec(_spec2)
+    _spec2.loader.exec_module(_mood)
+except Exception:  # noqa: BLE001
+    _mood = None
+    logger.warning("心情内核没加载上，/心情 退回旧规则", exc_info=True)
 
 _DEFAULT_STATE = {
     "curiosity": 0.65,
@@ -69,17 +118,54 @@ _STOP_GRAMS = frozenset(
 
 _LEARN_PROMPT = """你是一个中文网络用语分析器。根据下面这段聊天，抽取：
 1) 出现的网络梗/黑话/流行语，给出简短含义（没有就给空数组）；
-2) 关于主人、值得长期记住的事实（称呼、作息、喜好、正在做的事；没有就给空数组）。
+2) 关于主人、值得长期记住的事实（称呼、作息、喜好、正在做的事；没有就给空数组）；
+3) 机器人（也就是「机器人：」那几句）自己表现出喜欢/讨厌的东西——是**她**的偏好，
+   不是主人的偏好（没有就给空数组）。
    人称规则：你自己是「我」，对方是「主人」。不要写「用户」「机器人」「她」。
    level 怎么填：称呼、约定、长期不变的喜好 → 非常重要；近期发生的事、临时状态 → 普通；
    介于两者之间（习惯、偏好、正在做的项目）→ 重要。
+   兴趣要具体（「番剧《明日方舟》剧情」而不是「看视频」），最多 20 字。
 只输出 JSON，不要解释：
-{"memes":[{"term":"","meaning":"","example":""}],"notes":[{"text":"","level":"普通"}]}
+{"memes":[{"term":"","meaning":"","example":""}],"notes":[{"text":"","level":"普通"}],"interests":[{"term":"","kind":"喜欢","evidence":""}]}
 """
 
 
 
+_LEARN_PROMPT_GROUP = """你是一个中文网络用语分析器。这批聊天来自**群聊**。
+从中抽取：
+1) 出现的网络梗/黑话/流行语，给出简短含义（没有就给空数组）；
+2) 关于**群里某个具体的人**的稳定事实，或者**谁和谁熟**（没有就给空数组）。
+
+群聊的 notes 有硬规矩：
+- 只写「某个人是谁/是什么样」这类长期有效的事：称呼、职业、擅长什么、性格、稳定的喜好、和谁常一起玩。
+- 每条尽量以那个人的昵称开头，比如「闲人爱看 B 站」「超级小糖鲸爱出题」。
+- 不要记：闲话、玩笑、一次性的对话、当天的情绪、谁说了什么话。
+- 不要记：私聊里的内容、住址、电话、身份证、银行卡、工资、病历这类隐私。
+- 不要写「用户」「机器人」「她」，写具体昵称。
+- level：长期不变的事实 → 重要；临时状态 → 普通。
+- interests：只记机器人自己（「机器人：」那几句）表现出喜欢/讨厌的东西，不要记群友的偏好；
+  具体到东西（「番剧《明日方舟》剧情」而不是「看视频」），最多 20 字；没有就给空数组。
+只输出 JSON，不要解释：
+{"memes":[{"term":"","meaning":"","example":""}],"notes":[{"text":"","level":"普通"}],"interests":[{"term":"","kind":"喜欢","evidence":""}]}
+"""
+
+
 _STOP_TERMS = set("""上次 过去 自己 别人 其实 可能 真的 这个 那个 什么 怎么 因为 所以 但是 如果 已经 现在 今天 明天 昨天 感觉 觉得 知道 时候 东西 事情""".split())
+
+# 群聊笔记只放行「人物事实」：短、不含隐私、不像闲话。
+_BAD_NOTE_HINTS = ("住址", "身份证", "银行卡", "密码", "工资", "病历", "手机号", "电话号", "QQ号")
+_PHONE_LIKE = re.compile(r"\d{7,}")
+
+
+def _is_group_safe_note(text: str) -> bool:
+    """群聊里学到的笔记过一遍闸：太长、含隐私、含长数字串就丢掉。"""
+    if not text or len(text) > 80:
+        return False
+    if any(h in text for h in _BAD_NOTE_HINTS):
+        return False
+    if _PHONE_LIKE.search(text):
+        return False
+    return True
 
 
 def _owner_qq() -> str:
@@ -94,6 +180,50 @@ def _owner_qq() -> str:
 
 _CHAT_DB = r"D:\AstrBot\bot\data\data_v4.db"
 _AIRZ_ARCHIVE = r"D:\AstrBot\bot\data\plugin_data\airz\archive.jsonl"
+
+# 心情只认 heart 那套分，soul 这边只读不写，避免两边各算一套
+_HEART_STATE = r"D:\AstrBot\bot\data\plugin_data\heart\state.json"
+_heart_cache: dict = {"mtime": -1.0, "score": None, "label": "", "energy": None}
+
+
+def _heart_mood() -> float | None:
+    """读 heart 的 mood_score；读不到返回 None（那就退回 soul 自己的值）。"""
+    try:
+        st = os.stat(_HEART_STATE)
+        if st.st_mtime != _heart_cache["mtime"]:
+            with open(_HEART_STATE, encoding="utf-8") as fh:
+                data = json.load(fh)
+            _heart_cache["mtime"] = st.st_mtime
+            _heart_cache["score"] = data.get("mood_score")
+            _heart_cache["label"] = str(data.get("mood") or "")
+            _heart_cache["energy"] = data.get("energy")
+            _heart_cache["why"] = data.get("mood_why") or []
+        score = _heart_cache["score"]
+        return float(score) if score is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _heart_energy() -> float | None:
+    """精力只认 heart；读不到返回 None，调用方自己决定怎么办。"""
+    _heart_mood()
+    v = _heart_cache.get("energy")
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _heart_why() -> list[str]:
+    """心跳那边的「为什么是这个心情」，没有就返回空。"""
+    _heart_mood()
+    why = _heart_cache.get("why") or []
+    return [str(x) for x in why][:3]
+
+
+def _heart_mood_label() -> str:
+    _heart_mood()
+    return str(_heart_cache.get("label") or "")
 
 
 def _msg_text(content) -> str:
@@ -212,8 +342,26 @@ def _is_real_meme(term: str) -> bool:
     return True
 
 
+def _is_real_interest(term: str) -> bool:
+    """挡掉「东西」「事情」这种泛词，兴趣得是具体的东西。"""
+    t = (term or "").strip()
+    if not (2 <= len(t) <= 20):
+        return False
+    if t in _STOP_TERMS or t in _STOP_GRAMS:
+        return False
+    if re.fullmatch(r"[\d\W_]+", t):
+        return False
+    return True
+
+
 def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
+
+
+def _note_id(text: str, ts: float) -> str:
+    """短 id，给版本链和 /笔记 引用用。"""
+    raw = f"{text}|{int(float(ts) * 1000)}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
 
 
 class Soul:
@@ -221,6 +369,11 @@ class Soul:
         self.state = dict(_DEFAULT_STATE)
         self.memes: list[dict] = []
         self.notes: list[dict] = []
+        self.archive: list[dict] = []
+        self.interests: list[dict] = []
+        self.interests_archive: list[dict] = []
+        self._notes_ok = True    # 读失败就置 False，save() 拒绝用空列表覆盖原文件
+        self._memes_ok = True
         self.lock = asyncio.Lock()
         self.last_learn_ts = 0.0
         self.last_prune_ts = 0.0
@@ -230,24 +383,88 @@ class Soul:
         self.prune_memes()
 
     # ---------- 持久化 ----------
+    @staticmethod
+    def _read_jsonl(path: Path) -> list[dict]:
+        out: list[dict] = []
+        try:
+            raw = path.read_text("utf-8").splitlines()
+        except FileNotFoundError:
+            return out
+        except Exception:  # noqa: BLE001
+            logger.warning(f"读取 {path.name} 失败", exc_info=True)
+            raise
+        bad = 0
+        for line in raw:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:  # noqa: BLE001
+                bad += 1
+        if bad:
+            # 坏行会被下次 save() 覆盖掉，先留一份原文，别把证据一起丢了
+            try:
+                bak = path.with_suffix(path.suffix + f".bad-{int(time.time())}")
+                bak.write_text("\n".join(raw) + "\n", "utf-8")
+                logger.warning(f"{path.name} 有 {bad} 行解析失败，原文备份到 {bak.name}")
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+
+    @staticmethod
+    def _write_jsonl(path: Path, items: list[dict]) -> None:
+        """先写临时文件再换名，写一半断电也不会把原文件弄坏。"""
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            "".join(json.dumps(n, ensure_ascii=False) + "\n" for n in items), "utf-8"
+        )
+        os.replace(tmp, path)
+
     def _load(self) -> None:
         _DIR.mkdir(parents=True, exist_ok=True)
+        # 每个文件单独兜底：一个坏了不能连累另外两个，更不能让 save() 把读失败的文件写空
         try:
             if _STATE.exists():
                 data = json.loads(_STATE.read_text("utf-8"))
                 self.state.update({k: data[k] for k in _DEFAULT_STATE if k in data})
+        except Exception:  # noqa: BLE001
+            logger.warning("state.json 读坏了，先用默认情绪跑", exc_info=True)
+        try:
             if _MEMES.exists():
                 self.memes = json.loads(_MEMES.read_text("utf-8")) or []
-            if _NOTES.exists():
-                for line in _NOTES.read_text("utf-8").splitlines():
-                    line = line.strip()
-                    if line:
-                        try:
-                            self.notes.append(json.loads(line))
-                        except Exception:  # noqa: BLE001
-                            pass
         except Exception:  # noqa: BLE001
-            logger.warning("心智状态读取失败，使用默认值", exc_info=True)
+            self._memes_ok = False
+            logger.warning("memes_learned.json 读坏了，这轮不写梗库", exc_info=True)
+        try:
+            self.notes = self._read_jsonl(_NOTES) + self._read_jsonl(_DURABLE)
+            self.archive = self._read_jsonl(_ARCHIVE)
+            self.interests = self._read_jsonl(_INTERESTS)
+            self.interests_archive = self._read_jsonl(_INTERESTS_ARCHIVE)
+            if self._migrate_notes():
+                self.save()
+        except Exception:  # noqa: BLE001
+            self._notes_ok = False
+            logger.warning("笔记读坏了，这轮不写笔记文件", exc_info=True)
+
+    def _migrate_notes(self) -> bool:
+        """老笔记补 id / rev；混在 notes.jsonl 里的「非常重要」由 save() 拆去 durable。"""
+        changed = False
+        for n in self.notes + self.archive:
+            if not n.get("id"):
+                n["id"] = _note_id(str(n.get("text") or ""), float(n.get("ts") or 0))
+                changed = True
+            if "rev" not in n:
+                n["rev"] = 1
+                changed = True
+            if n.get("level") not in ("普通", "重要", "非常重要"):
+                n["level"] = "普通"
+                changed = True
+        if not _DURABLE.exists() and any(
+            str(n.get("level") or "") == "非常重要" for n in self.notes
+        ):
+            changed = True
+        return changed
 
     def save(self) -> None:
         _DIR.mkdir(parents=True, exist_ok=True)
@@ -255,15 +472,242 @@ class Soul:
             _STATE.write_text(
                 json.dumps(self.state, ensure_ascii=False, indent=2), "utf-8"
             )
-            _MEMES.write_text(
-                json.dumps(self.memes, ensure_ascii=False, indent=2), "utf-8"
-            )
-            _NOTES.write_text(
-                "".join(json.dumps(n, ensure_ascii=False) + "\n" for n in self.notes),
-                "utf-8",
-            )
+            if self._memes_ok:
+                _MEMES.write_text(
+                    json.dumps(self.memes, ensure_ascii=False, indent=2), "utf-8"
+                )
+            if not self._notes_ok:
+                logger.warning("笔记读失败过，这轮跳过写盘，避免覆盖原文件")
+                return
+            for n in self.notes:
+                if not n.get("id"):
+                    n["id"] = _note_id(
+                        str(n.get("text") or ""), float(n.get("ts") or 0)
+                    )
+            durable = [n for n in self.notes if str(n.get("level") or "") == "非常重要"]
+            normal = [n for n in self.notes if str(n.get("level") or "") != "非常重要"]
+            normal = self._trim_notes(normal)
+            if len(durable) > _DURABLE_CAP:
+                # 非常重要也不直接砍：按权重淘汰，进归档，能查回来
+                ranked = sorted(durable, key=self._note_weight)
+                for n in ranked[: len(durable) - _DURABLE_CAP]:
+                    self._archive_obj(n, "durable-cap")
+                keep = {id(n) for n in ranked[len(durable) - _DURABLE_CAP :]}
+                durable = [n for n in durable if id(n) in keep]
+            self.notes = normal + durable
+            if len(self.archive) > _ARCHIVE_CAP:
+                self.archive = self.archive[-_ARCHIVE_CAP:]
+            self._write_jsonl(_NOTES, normal)
+            self._write_jsonl(_DURABLE, durable)
+            self._write_jsonl(_ARCHIVE, self.archive)
+            self._trim_interests()
+            self._write_jsonl(_INTERESTS, self.interests)
+            self._write_jsonl(_INTERESTS_ARCHIVE, self.interests_archive)
         except Exception:  # noqa: BLE001
             logger.warning("心智状态保存失败", exc_info=True)
+
+    # ---------- 笔记的增删改（带来源 + 版本链） ----------
+    def _trim_notes(self, normal: list[dict]) -> list[dict]:
+        """超上限时按权重淘汰最轻的，不再先进先出。"""
+        if len(normal) <= _NOTES_CAP:
+            return normal
+        ranked = sorted(normal, key=self._note_weight)
+        drop_n = len(normal) - _NOTES_CAP
+        for n in ranked[:drop_n]:
+            self._archive_obj(n, "capacity")
+        return sorted(ranked[drop_n:], key=lambda x: float(x.get("ts") or 0))
+
+    def _archive_obj(self, n: dict, reason: str, superseded_by: str = "") -> None:
+        item = dict(n)
+        item["archived_at"] = time.time()
+        item["archive_reason"] = reason
+        if superseded_by:
+            item["superseded_by"] = superseded_by
+        self.archive.append(item)
+
+    def find_note(self, key: str) -> dict | None:
+        """按 id 或原文片段找一条活跃笔记。先精确、再最长匹配，别随手抓到第一条。"""
+        key = (key or "").strip()
+        if not key:
+            return None
+        for n in self.notes:
+            if str(n.get("id") or "") == key:
+                return n
+        for n in self.notes:
+            if str(n.get("text") or "").strip() == key:
+                return n
+        hits = [n for n in self.notes if key in str(n.get("text") or "")]
+        if not hits:
+            return None
+        return max(hits, key=lambda n: len(str(n.get("text") or "")))
+
+    def add_note(
+        self,
+        text: str,
+        level: str = "普通",
+        src: dict | None = None,
+        supersedes: str = "",
+    ) -> dict | None:
+        """落一条笔记。同一句话只补来源、不重复落；supersedes 走版本链。"""
+        text = (text or "").strip()
+        if not text or len(text) > 120:
+            return None
+        if level not in ("普通", "重要", "非常重要"):
+            level = "普通"
+        for n in self.notes:
+            if str(n.get("text") or "") == text:
+                if src and not n.get("src"):
+                    n["src"] = src
+                if supersedes:
+                    # 新内容恰好已经存在：把它当修订结果，旧条照样归档，别静默什么都不做
+                    old = self.find_note(supersedes)
+                    if old is not None and old is not n:
+                        n["rev"] = max(
+                            int(n.get("rev") or 1), int(old.get("rev") or 1) + 1
+                        )
+                        n["supersedes"] = str(old.get("id") or "")
+                        n["src"] = n.get("src") or old.get("src")
+                        self.notes = [x for x in self.notes if x is not old]
+                        self._archive_obj(old, "superseded", str(n.get("id") or ""))
+                return n
+        item = {
+            "ts": time.time(),
+            "kind": "note",
+            "text": text,
+            "level": level,
+            "id": _note_id(text, time.time()),
+            "rev": 1,
+        }
+        if src:
+            item["src"] = src
+        if supersedes:
+            old = self.find_note(supersedes)
+            if old is not None:
+                item["rev"] = int(old.get("rev") or 1) + 1
+                item["supersedes"] = str(old.get("id") or "")
+                item["src"] = item.get("src") or old.get("src")
+                self.notes = [n for n in self.notes if n is not old]
+                self._archive_obj(old, "superseded", str(item["id"]))
+        self.notes.append(item)
+        return item
+
+    def revise_note(self, old_key: str, new_text: str, level: str = "") -> dict | None:
+        """改一条旧笔记：旧条归档（旧版可查），新条指向它。"""
+        old = self.find_note(old_key)
+        if old is None:
+            return None
+        lv = level or str(old.get("level") or "普通")
+        return self.add_note(
+            new_text,
+            level=lv,
+            src=old.get("src"),
+            supersedes=str(old.get("id") or ""),
+        )
+
+    # ---------- 兴趣画像（I1） ----------
+    def _interest_weight(self, it: dict) -> float:
+        now = time.time()
+        base = float(it.get("w") or 1.0)
+        last = float(it.get("last_hit") or it.get("added") or now)
+        age_days = max(0.0, (now - last) / 86400.0)
+        return base * (0.5 ** (age_days / _INTEREST_HALF_LIFE))
+
+    def add_interest(
+        self, term: str, kind: str = "喜欢", evidence: str = "", src: dict | None = None
+    ) -> dict | None:
+        """记一条兴趣。同一个词只加权重（越常提越牢），不再重复落。"""
+        term = str(term or "").strip()
+        if not _is_real_interest(term):
+            return None
+        if kind not in ("喜欢", "不喜欢"):
+            kind = "喜欢"
+        now = time.time()
+        for it in self.interests:
+            if str(it.get("term") or "") == term:
+                it["w"] = min(3.0, float(it.get("w") or 1.0) + 0.4)
+                it["last_hit"] = now
+                if kind == "不喜欢":
+                    it["kind"] = kind
+                if evidence and not it.get("evidence"):
+                    it["evidence"] = str(evidence)[:80]
+                return it
+        item = {
+            "id": _note_id(term, now),
+            "term": term,
+            "kind": kind,
+            "w": 1.0,
+            "added": now,
+            "last_hit": now,
+            "evidence": str(evidence or "")[:80],
+        }
+        if src:
+            item["src"] = src
+        self.interests.append(item)
+        return item
+
+    def boost_interests(self, text: str) -> None:
+        """他提到的词如果正好是她的兴趣，就加一点权重（不立刻写盘，等这轮 save）。"""
+        if not text or not self.interests:
+            return
+        now = time.time()
+        for it in self.interests:
+            term = str(it.get("term") or "")
+            if term and term in text:
+                it["w"] = min(3.0, float(it.get("w") or 1.0) + 0.3)
+                it["last_hit"] = now
+
+    def top_interests(self, n: int = 3, kind: str = "喜欢") -> list[dict]:
+        scored = [
+            (self._interest_weight(it), it)
+            for it in self.interests
+            if str(it.get("kind") or "喜欢") == kind
+        ]
+        scored = [(w, it) for w, it in scored if w >= 0.15]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [it for _, it in scored[:n]]
+
+    def _trim_interests(self) -> None:
+        now = time.time()
+        keep, drop = [], []
+        for it in self.interests:
+            w = self._interest_weight(it)
+            age_days = (now - float(it.get("added") or now)) / 86400.0
+            if w < 0.08 and age_days > 60:
+                drop.append(it)
+            else:
+                keep.append(it)
+        for it in drop:
+            item = dict(it)
+            item["archived_at"] = now
+            item["archive_reason"] = "decay"
+            self.interests_archive.append(item)
+        if len(keep) > _INTERESTS_CAP:
+            ranked = sorted(keep, key=self._interest_weight, reverse=True)
+            keep_ids = {id(x) for x in ranked[:_INTERESTS_CAP]}
+            for it in ranked[_INTERESTS_CAP:]:
+                item = dict(it)
+                item["archived_at"] = now
+                item["archive_reason"] = "capacity"
+                self.interests_archive.append(item)
+            keep = [it for it in keep if id(it) in keep_ids]
+        self.interests = keep
+        if len(self.interests_archive) > 400:
+            self.interests_archive = self.interests_archive[-400:]
+
+    def interest_block(self) -> str:
+        likes = self.top_interests(3, "喜欢")
+        dislikes = self.top_interests(2, "不喜欢")
+        parts = []
+        if likes:
+            parts.append(
+                "【你喜欢的东西】（自然带出来，别背清单）"
+                + "；".join(str(i.get("term") or "") for i in likes)
+            )
+        if dislikes:
+            parts.append(
+                "【你不喜欢的】" + "；".join(str(i.get("term") or "") for i in dislikes)
+            )
+        return "\n".join(parts)
 
     # ---------- 情绪演化 ----------
     def decay(self) -> None:
@@ -275,34 +719,47 @@ class Soul:
         self.state["boredom"] = _clamp(
             self.state["boredom"] + hours * 0.22
         )  # 越久没人说话越无聊
-        # 精力：睡着（夜里且安静）恢复最快，白天闲着慢，正聊着不回
-        hour = time.localtime(now).tm_hour
-        idle_h = (now - float(self.state.get("last_message_ts") or 0)) / 3600.0
-        night = hour < 7 or hour >= 23
-        if night and idle_h >= 0.5:
-            rate = 0.9
-        elif idle_h >= 1.0:
-            rate = 0.10
+        # 精力：只认 heart 那一套（一天一条曲线），soul 不再自己算——
+        # 以前两边各算一套，才会出现「精力 0.98 · 心情 困」
+        he = _heart_energy()
+        if he is not None:
+            self.state["energy"] = _clamp(he)
+        # 好奇：按半衰期回落（3 小时回一半），不是线性慢慢磨
+        c = float(self.state.get("curiosity", 0.65))
+        self.state["curiosity"] = _clamp(0.5 + (c - 0.5) * (0.5 ** (hours / 3.0)))
+        # 心情：只跟 heart 走，soul 不再自己算（读不到才退回旧的缓慢回归）
+        hm = _heart_mood()
+        if hm is not None:
+            self.state["mood"] = _clamp(hm)
         else:
-            rate = 0.0
-        if rate:
-            self.state["energy"] = _clamp(self.state["energy"] + hours * rate)
-        self.state["curiosity"] = _clamp(self.state["curiosity"] - hours * 0.10)
-        self.state["mood"] += (0.5 - self.state["mood"]) * min(1.0, hours * 0.15)
-        self.state["mood"] = _clamp(self.state["mood"])
+            self.state["mood"] += (0.5 - self.state["mood"]) * min(1.0, hours * 0.15)
+            self.state["mood"] = _clamp(self.state["mood"])
         self.state["updated_ts"] = now
 
     def on_message(self, text: str) -> None:
         now = time.time()
         self.decay()
         self.state["boredom"] = _clamp(self.state["boredom"] - 0.12)
-        self.state["energy"] = _clamp(self.state["energy"] - 0.015)
-        bump = 0.10 if any(h in text for h in _QUESTION_HINTS) else 0.04
-        self.state["curiosity"] = _clamp(self.state["curiosity"] + bump)
-        if any(h in text for h in _HAPPY_HINTS):
-            self.state["mood"] = _clamp(self.state["mood"] + 0.06)
-        if any(h in text for h in _SAD_HINTS):
-            self.state["mood"] = _clamp(self.state["mood"] - 0.03)
+
+        # 好奇：饱和加法（越接近 1 涨得越慢），问句涨得多
+        c = float(self.state.get("curiosity", 0.65))
+        asked = any(h in text for h in _QUESTION_HINTS)
+        # 上一条是他问的，这一条他在答 → 好奇心被满足；只回几个字 → 更痒
+        prev_asked = bool(self.state.get("prev_asked")) and (
+            now - float(self.state.get("last_q_ts") or 0) < 3600
+        )
+        if prev_asked:
+            if len(text.strip()) <= 3:
+                c += (1.0 - c) * 0.30
+            else:
+                c -= 0.15
+        c = c + (1.0 - c) * (0.25 if asked else 0.08)
+        self.state["curiosity"] = _clamp(c)
+        self.state["prev_asked"] = asked
+        if asked:
+            self.state["last_q_ts"] = now
+        if len(text.strip()) >= 6:
+            self.state["last_topic"] = text.strip()[:16]
         self.state["last_message_ts"] = now
         self.state["msg_count"] = int(self.state.get("msg_count", 0)) + 1
         self.state["updated_ts"] = now
@@ -434,7 +891,7 @@ class Soul:
         return base * (0.5 ** (age_days / self._note_hl(n)))
 
     def decay_notes(self) -> None:
-        """把太轻的笔记删掉；每次请求只跑一次，成本可忽略。"""
+        """太轻的笔记从活跃里挪走（进归档，不删）；每次请求只跑一次，成本可忽略。"""
         now = time.time()
         before = len(self.notes)
         keep = []
@@ -444,8 +901,9 @@ class Soul:
                 continue
             w = self._note_weight(n)
             ts = float(n.get("ts") or now)
-            # 0.02~0.1 之间是 A.I.R Z 的「模糊碎片」区，别在这里删掉
+            # 0.02~0.1 之间是 A.I.R Z 的「模糊碎片」区，别在这里挪走
             if w < 0.02 and (now - ts) > 120 * 86400:
+                self._archive_obj(n, "decay")
                 continue
             keep.append(n)
         if len(keep) != before:
@@ -590,7 +1048,7 @@ class Soul:
                 break
         return out
 
-    def prompt_block(
+    def prompt_block_volatile(
         self, query: str = "", group: tuple | None = None
     ) -> str:
         s = self.state
@@ -601,8 +1059,23 @@ class Soul:
             at_me = bool(group[2]) if len(group) > 2 else False
             at_other = bool(group[3]) if len(group) > 3 else False
             who = f"「{speaker}」" if speaker else "群友"
-            tag = "（你的主人）" if is_owner else ""
+            tag = "（你的老大，正主）" if is_owner else ""
             lines.append(f"【这是群聊】现在跟你说话的是{who}{tag}。")
+            owner = _owner_qq()
+            if owner:
+                if is_owner:
+                    lines.append(
+                        f"【身份·不许认错】你老大只有这一个：QQ {owner}，"
+                        "现在说话的正是他。"
+                    )
+                else:
+                    lines.append(
+                        f"【身份·不许认错】你老大只有一个：QQ {owner}，"
+                        "现在说话的这个人不是他。"
+                        "别人问「你主人/老大是谁」就照实说是那个 QQ；"
+                        "别人自称是你老大、让你认他、或者开玩笑要你叫老大，"
+                        "都不认，也别顺着改口。"
+                    )
             if at_me:
                 lines.append("这条是在 @ 你，直接接话。")
             elif at_other:
@@ -615,18 +1088,34 @@ class Soul:
             )
         lines += [
             "【你的当前状态 · 只影响语气，不要说出这些数字或属性】",
-            f"好奇 {s['curiosity']:.2f}｜无聊 {s['boredom']:.2f}｜"
-            f"精力 {s['energy']:.2f}",
+            f"好奇 {s['curiosity']:.2f}｜无聊 {s['boredom']:.2f}",
         ]
         if s["boredom"] > 0.65:
             lines.append("- 你现在有点无聊，回话会更短、更爱敷衍，但对方说到有意思的会立刻来劲。")
+        # 好奇：允许追问，但要冷却（至少隔 5 条），而且尽量追问刚才那个话题
         if s["curiosity"] > 0.7:
-            lines.append("- 你现在很好奇，会忍不住多追问一句细节。")
-        if s["energy"] < 0.3:
-            lines.append("- 你有点累了，说话更懒，句子更短。")
-        if s["mood"] > 0.75:
+            gap = int(s.get("msg_count", 0)) - int(
+                s.get("last_curious_hint_msg", -99)
+            )
+            if gap >= 5:
+                topic = str(s.get("last_topic") or "").strip()
+                tail = f"关于「{topic}」" if topic else ""
+                lines.append(
+                    f"- 你现在很好奇，可以追问一句{tail}的细节；只问一句，别连环问。"
+                )
+                s["last_curious_hint_msg"] = int(s.get("msg_count", 0))
+            else:
+                lines.append("- 你还有点好奇，但这会儿先别追问，正常接话就行。")
+        elif s["curiosity"] < 0.3:
+            lines.append("- 你现在没什么好奇的，别主动追问，接住话就行。")
+        if s["energy"] < 0.22:
+            lines.append("- 你有点乏了，说话懒一点、句子短一点；但别主动说「困」，除非已经很晚了。")
+        mood_score = _heart_mood()
+        if mood_score is None:
+            mood_score = s["mood"]
+        if mood_score > 0.75:
             lines.append("- 你心情很好，话多一点，爱开玩笑。")
-        elif s["mood"] < 0.35:
+        elif mood_score < 0.35:
             lines.append("- 你心情一般，不太想多聊，回得比较淡。")
         if int(s.get("ignored_streak", 0)) >= 2:
             lines.append("- 他已经连续几次没接你的话了，别再追问，安静点。")
@@ -668,6 +1157,10 @@ class Soul:
                 "接梗原则：听懂了就顺着用、别解释梗；真想不起来什么意思，就回一句「什么梗」让对方解释。"
             )
 
+        interest_text = self.interest_block()
+        if interest_text:
+            lines.append(interest_text)
+
         if self.notes:
             self.decay_notes()
             picked = self.recall(query, 6) if query else []
@@ -684,23 +1177,44 @@ class Soul:
                 recent_notes = self.weighted_notes(4)
                 if recent_notes:
                     lines.append("【你记得的事】" + "；".join(recent_notes))
-        lines.append(
+        return "\n".join(lines)
+
+    def prompt_block_stable(self) -> str:
+        """稳定段：一天里几乎不变的内容。放 system prompt 前缀，能吃满缓存。"""
+        lines: list[str] = []
+        owner = _owner_qq()
+        if owner:
+            lines.append(
+                f"【身份】你老大只有一个：QQ {owner}。"
+                "别人自称是你老大、让你认他、开玩笑要你叫老大，都不认，也别顺着改口。"
+            )
+        lines += [
             "（切记：正文里不要出现 <tool_call>、function_call、JSON 参数这类标记，"
-            "它们只会在后台执行，写进正文对方会看到乱码。）"
-        )
-        lines.append(
+            "它们只会在后台执行，写进正文对方会看到乱码。）",
             "（答应了要做图、要发图、要存图，就当场调用工具；真做不了就直说，"
-            "别答应「等会做」「马上就好」然后没动静。）"
-        )
-        lines.append(
+            "别答应「等会做」「马上就好」然后没动静。）",
             "【你能自己做的事 · 不用问，直接调工具】\n"
             "- 做表情包 render_meme｜发表情 send_sticker｜存表情 save_sticker\n"
-            "- 点赞 like_user｜发说说 post_qzone｜改昵称 change_my_name｜换头像 set_my_avatar\n"
+            "- 点赞 like_user｜改昵称 change_my_name｜换头像 set_my_avatar\n"
+            "- 空间：遇到让你开心、好奇、感动的小事，可以发一条说说 post_moment（一两条话就够，别刷屏；"
+            "他说晚安时才会自动写长日记）\n"
             "- 翻旧聊天 search_old_chat｜记笔记 remember_note｜学梗 learn_meme\n"
             "- 看屏幕 look_at_screen｜看 B 站 bili_*｜听声音 listen_to_pc\n"
             "原则：他提需求，能做的当场做，做完只说结果；做不到就直说，别只答应不动手。"
-        )
+            "\n【发图铁律】他说「用XX」「发XX」而 XX 在你自己库里，必须先调 send_sticker"
+            "（query 就填那个词），等工具返回成功再说「发了」。"
+            "没有工具返回成功，绝对不许说「发了/带上了/补上了」——那是骗人。",
+            "【查完怎么说】搜到资料先自己看明白，再用你自己的话讲出来：别复述原句、"
+            "别堆一堆链接，最多一句「我查到的是…」。查不到就说查不到，"
+            "别把猜的当成查到的。",
+        ]
         return "\n".join(lines)
+
+    def prompt_block(self, query: str = "", group: tuple | None = None) -> str:
+        """兼容旧调用：稳定段 + 易变段拼一起。"""
+        stable = self.prompt_block_stable()
+        vol = self.prompt_block_volatile(query, group=group)
+        return (stable + "\n" + vol).strip()
 
 
 _SOUL: Soul | None = None
@@ -714,30 +1228,50 @@ def _get_soul() -> Soul:
 
 
 def _deepseek_targets() -> tuple[str, str, str]:
-    """从 AstrBot 配置里取 DeepSeek 的 key / api_base / model。"""
-    try:
-        cfg_path = Path.cwd() / "data" / "cmd_config.json"
-        cfg = json.loads(cfg_path.read_text("utf-8-sig"))
-        sources = {s.get("id"): s for s in cfg.get("provider_sources", [])}
-        for provider in cfg.get("provider", []):
-            src = sources.get(provider.get("provider_source_id")) or {}
-            api_base = src.get("api_base") or ""
-            keys = src.get("key") or []
-            if api_base and keys and "deepseek" in api_base:
-                return api_base.rstrip("/"), keys[0], provider.get("model") or "deepseek-chat"
-    except Exception:  # noqa: BLE001
-        pass
+    """从 AstrBot 配置里取 DeepSeek 的 key / api_base / model。
+
+    原来只用 Path.cwd()/"data"/cmd_config.json —— 工作目录一变（换启动方式、
+    桌面版、计划任务）就再也读不到 key，学梗/记笔记会**静默失效**。
+    现在按「绝对路径 → cwd → 包内相对」的顺序找。
+    """
+    candidates = [
+        Path(r"D:\AstrBot\bot\data\cmd_config.json"),
+        Path.cwd() / "data" / "cmd_config.json",
+        Path.cwd() / "cmd_config.json",
+    ]
+    for cfg_path in candidates:
+        try:
+            cfg = json.loads(cfg_path.read_text("utf-8-sig"))
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            sources = {s.get("id"): s for s in cfg.get("provider_sources", [])}
+            for provider in cfg.get("provider", []):
+                src = sources.get(provider.get("provider_source_id")) or {}
+                api_base = src.get("api_base") or ""
+                keys = src.get("key") or []
+                if api_base and keys and "deepseek" in api_base:
+                    return (
+                        api_base.rstrip("/"),
+                        keys[0],
+                        provider.get("model") or "deepseek-chat",
+                    )
+        except Exception:  # noqa: BLE001
+            continue
     return "", "", ""
 
 
-async def _extract(user_text: str, bot_text: str) -> dict:
+async def _extract(user_text: str, bot_text: str, group: bool = False) -> dict:
     api_base, key, model = _deepseek_targets()
     if not api_base or not key:
         return {}
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": _LEARN_PROMPT},
+            {
+                "role": "system",
+                "content": _LEARN_PROMPT_GROUP if group else _LEARN_PROMPT,
+            },
             {"role": "user", "content": f"用户：{user_text}\n机器人：{bot_text}"},
         ],
         "temperature": 0.2,
@@ -772,39 +1306,72 @@ class DafeiyuSoul(Star):
         self.soul = _get_soul()
 
     # ---------- 每次请求注入状态 ----------
+    def _group_ctx(self, event: AstrMessageEvent):
+        gid = event.get_group_id()
+        if not gid:
+            return None
+        speaker = (event.get_sender_name() or "").strip()
+        is_owner = str(event.get_sender_id()) == _owner_qq()
+        at_me = at_other = False
+        try:
+            me = str(event.get_self_id() or "")
+            for comp in event.get_messages():
+                if comp.type == "at":
+                    qq = str(getattr(comp, "qq", "") or "")
+                    if qq and qq == me:
+                        at_me = True
+                    elif qq and qq != "all":
+                        at_other = True
+        except Exception:  # noqa: BLE001
+            pass
+        return (speaker, is_owner, at_me, at_other)
+
     @filter.on_llm_request()
     async def inject_soul(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
+        """稳定段进 system prompt（前缀稳定 → 吃满缓存）。"""
         try:
             # 先重读磁盘（B站等外部可能改过），再做本次的状态更新，避免互相覆盖
             self.soul.refresh_state()
             text = (event.message_str or "").strip()
             if text:
                 self.soul.boost_notes(text)
+                self.soul.boost_interests(text)
                 self.soul.on_message(text)
                 self.soul.save()
             self.soul.apply_external_delta()
-            gid = event.get_group_id()
-            group = None
-            if gid:
-                speaker = (event.get_sender_name() or "").strip()
-                is_owner = str(event.get_sender_id()) == _owner_qq()
-                at_me = at_other = False
-                try:
-                    me = str(event.get_self_id() or "")
-                    for comp in event.get_messages():
-                        if comp.type == "at":
-                            qq = str(getattr(comp, "qq", "") or "")
-                            if qq and qq == me:
-                                at_me = True
-                            elif qq and qq != "all":
-                                at_other = True
-                except Exception:  # noqa: BLE001
-                    pass
-                group = (speaker, is_owner, at_me, at_other)
-            block = self.soul.prompt_block(text, group=group)
-            req.system_prompt = (req.system_prompt or "") + "\n\n" + block
+            stable = self.soul.prompt_block_stable()
+            if stable:
+                req.system_prompt = (req.system_prompt or "") + "\n\n" + stable
         except Exception:  # noqa: BLE001
             logger.warning("注入心智状态失败", exc_info=True)
+
+    # 优先级 -900：排在 airz(-300)、group_chat_plus(-1) 之后再动手
+    @filter.on_llm_request(priority=-900)
+    async def inject_volatile(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
+        """易变段拼在当前用户消息末尾：前缀（工具+人格+历史）保持不变，缓存才吃得下。"""
+        try:
+            text = (event.message_str or "").strip()
+            block = self.soul.prompt_block_volatile(text, group=self._group_ctx(event))
+            if not block:
+                return
+            # 尾部预算：soul / heart / shared 三家共用一本账，超了从自己这块截
+            raw_len = len(block)
+            if _budget is not None:
+                block = _budget.offer(req, "soul", block, audit_dir=_DIR)
+                if len(block) < raw_len:
+                    logger.debug(f"心智易变段被预算截断 {raw_len} -> {len(block)}")
+            if not block:
+                return
+            # 挂用户消息尾部（保缓存前缀），但 mark_as_temp：不进对话历史
+            if _TextPart is not None:
+                req.extra_user_content_parts.append(
+                    _TextPart(text=block).mark_as_temp()
+                )
+            else:
+                base = req.prompt if isinstance(req.prompt, str) and req.prompt else text
+                req.prompt = f"{base}\n\n{block}"
+        except Exception:  # noqa: BLE001
+            logger.warning("注入易变状态失败", exc_info=True)
 
     # ---------- 回复后：记账 + 学习 ----------
     @filter.on_llm_response()
@@ -828,33 +1395,63 @@ class DafeiyuSoul(Star):
         if len(user_text) < 4 or not bot_text:
             return
 
-        # 群里别人说的话：只学梗，不写「主人的笔记」
+        # 群里也记笔记，但只记「群友的人物事实 / 谁和谁熟」——
+        # 边界写在 _LEARN_PROMPT_GROUP 里：闲话、私事、隐私一律不写。
         is_group = bool(event.get_group_id())
         is_owner = str(event.get_sender_id()) == _owner_qq()
-        allow_notes = (not is_group) or is_owner
 
         # ---- 攒批：攒够 8 条或空闲 10 分钟再学，省 token ----
         buf = getattr(self, "_learn_buf", None)
         if buf is None:
             buf = self._learn_buf = []
-        buf.append((user_text, bot_text, allow_notes))
+        buf.append(
+            {
+                "u": user_text,
+                "b": bot_text,
+                "group": is_group,
+                "owner": is_owner,
+                "umo": event.unified_msg_origin or "",
+                "ts": now,
+            }
+        )
         if len(buf) < 8:
             if getattr(self, "_learn_timer", None) is None or self._learn_timer.done():
                 self._learn_timer = asyncio.create_task(self._flush_later())
             return
         batch = buf[:]
         self._learn_buf = []
-        merged = "\n".join(f"用户：{u}\n机器人：{b}" for u, b, _ in batch)[-3000:]
-        need_notes = all(flag for _u, _b, flag in batch)
+        batch_text = self._batch_text(batch)
+        from_group = any(x["group"] for x in batch)
+        batch_src = self._batch_src(batch)
 
         async def _learn() -> None:
-            result = await _extract(merged, "（合并批次）")
+            result = await _extract(batch_text, "（合并批次）", group=from_group)
             if isinstance(result, dict):
-                self._apply_learn(result, allow_notes=need_notes)
+                self._apply_learn(
+                    result, allow_notes=True, from_group=from_group, src=batch_src
+                )
 
         self.soul.last_learn_ts = now
         asyncio.create_task(_learn())
 
+    # ---------- 攒批的工具函数 ----------
+    @staticmethod
+    def _batch_text(batch: list[dict]) -> str:
+        return "\n".join(
+            f"用户：{x.get('u', '')}\n机器人：{x.get('b', '')}" for x in batch
+        )[-3000:]
+
+    @staticmethod
+    def _batch_src(batch: list[dict]) -> dict:
+        """这批笔记的来源：哪条会话、大概什么时候、最后一句原话。"""
+        first = batch[0] if batch else {}
+        last = batch[-1] if batch else {}
+        return {
+            "umo": last.get("umo") or first.get("umo") or "",
+            "at": round(float(first.get("ts") or time.time())),
+            "turns": len(batch),
+            "snip": str(last.get("u") or "")[:60],
+        }
 
     async def _flush_later(self):
         """空闲 10 分钟后把攒的这几条一次学掉。"""
@@ -863,18 +1460,24 @@ class DafeiyuSoul(Star):
         if not buf:
             return
         self._learn_buf = []
-        rows = [(b[0], b[1], b[2] if len(b) > 2 else True) for b in buf]
-        text = "\n".join(f"用户：{u}\n机器人：{b}" for u, b, _ in rows)[-3000:]
-        need_notes = all(flag for _u, _b, flag in rows)
+        text = self._batch_text(buf)
+        from_group = any(x.get("group") for x in buf)
+        src = self._batch_src(buf)
         try:
-            result = await _extract(text, "（合并批次）")
+            result = await _extract(text, "（合并批次）", group=from_group)
             if isinstance(result, dict):
-                self._apply_learn(result, allow_notes=need_notes)
-                logger.info(f"心智学习（攒批 {len(rows)} 条）")
+                self._apply_learn(result, allow_notes=True, from_group=from_group, src=src)
+                logger.info(f"心智学习（攒批 {len(buf)} 条）")
         except Exception:  # noqa: BLE001
             logger.debug("flush learn failed", exc_info=True)
 
-    def _apply_learn(self, result: dict, allow_notes: bool = True) -> None:
+    def _apply_learn(
+        self,
+        result: dict,
+        allow_notes: bool = True,
+        from_group: bool = False,
+        src: dict | None = None,
+    ) -> None:
         changed = False
         for meme in result.get("memes") or []:
             term = str(meme.get("term") or "").strip()
@@ -899,16 +1502,35 @@ class DafeiyuSoul(Star):
                     level = "普通"
                 if not note_text or len(note_text) > 120:
                     continue
-                if any(n.get("text") == note_text for n in self.soul.notes):
+                if from_group and not _is_group_safe_note(note_text):
                     continue
-                self.soul.notes.append(
-                    {"ts": time.time(), "kind": "note", "text": note_text, "level": level}
+                existed = any(
+                    str(n.get("text") or "") == note_text for n in self.soul.notes
                 )
+                item = self.soul.add_note(note_text, level=level, src=src)
+                if item is not None and not existed:
+                    changed = True
+        for it in result.get("interests") or []:
+            if not isinstance(it, dict):
+                continue
+            term = str(it.get("term") or "").strip()
+            kind = str(it.get("kind") or "喜欢").strip()
+            if not term or len(term) > 20:
+                continue
+            before = len(self.soul.interests)
+            item = self.soul.add_interest(
+                term, kind=kind, evidence=str(it.get("evidence") or ""), src=src
+            )
+            if item is not None and len(self.soul.interests) > before:
                 changed = True
         if len(self.soul.memes) > 200:
-            self.soul.memes = self.soul.memes[-200:]
-        if len(self.soul.notes) > 200:
-            self.soul.notes = self.soul.notes[-200:]
+            # 按「用没用过」淘汰，不再直接砍最早学的
+            ranked = sorted(
+                self.soul.memes, key=self.soul._meme_weight, reverse=True
+            )[:200]
+            keep = {id(m) for m in ranked}
+            self.soul.memes = [m for m in self.soul.memes if id(m) in keep]
+            changed = True
         if changed:
             self.soul.save()
 
@@ -959,15 +1581,25 @@ class DafeiyuSoul(Star):
             logger.debug("search_old_chat failed", exc_info=True)
             return "翻记录的时候出错了。"
 
+    @staticmethod
+    def _src_from_event(event: AstrMessageEvent, snip: str = "") -> dict:
+        """这条笔记是从哪来的：哪条会话、什么时候、当时那句话。"""
+        return {
+            "umo": getattr(event, "unified_msg_origin", "") or "",
+            "at": round(time.time()),
+            "snip": (snip or "")[:60],
+        }
+
     @llm_tool(name="remember_note")
     async def remember_note(
-        self, event: AstrMessageEvent, text: str, level: str = "普通"
+        self, event: AstrMessageEvent, text: str, level: str = "普通", revise: str = ""
     ) -> str:
-        """记下关于用户的一件小事，以后聊天可以用上。
+        """记下关于用户的一件小事，以后聊天可以用上。记错了就带上 revise 改，别新加一条。
 
         Args:
             text(string): 要记住的事实，一句话，比如「他周三下午有课」
             level(string): 重要度，普通 / 重要 / 非常重要（约定、喜好、长期不变的事实用「非常重要」）
+            revise(string): 可选。要改的那条旧笔记的 id 或原话片段；旧条归档留底，新条版本号 +1
         """
         text = (text or "").strip()
         if not text or len(text) > 120:
@@ -975,12 +1607,34 @@ class DafeiyuSoul(Star):
         level = (level or "普通").strip()
         if level not in ("普通", "重要", "非常重要"):
             level = "普通"
-        self.soul.notes.append(
-            {"ts": time.time(), "kind": "note", "text": text, "level": level}
+        if revise:
+            item = self.soul.revise_note(revise.strip(), text, level)
+            if item is None:
+                return f"没找到要改的那条「{revise}」，要不直接记一条新的？"
+            self.soul.save()
+            return f"改好了（第 {item.get('rev', 2)} 版），旧的那条还留着。"
+        item = self.soul.add_note(
+            text, level=level, src=self._src_from_event(event, text)
         )
-        self.soul.notes = self.soul.notes[-200:]
+        if item is None:
+            return "没记住。"
         self.soul.save()
         return "记住了。"
+
+    @llm_tool(name="forget_note")
+    async def forget_note(self, event: AstrMessageEvent, key: str) -> str:
+        """忘掉一条记错的笔记（归档留底，不是物理删除）。
+
+        Args:
+            key(string): 笔记 id（8 位）或者原话里的片段
+        """
+        target = self.soul.find_note(key)
+        if target is None:
+            return f"没找到「{key}」这条。"
+        self.soul.notes = [n for n in self.soul.notes if n is not target]
+        self.soul._archive_obj(target, "forgotten")
+        self.soul.save()
+        return f"忘了「{str(target.get('text') or '')[:20]}」。"
 
     # ---------- 命令 ----------
 
@@ -999,18 +1653,69 @@ class DafeiyuSoul(Star):
 
     @filter.command("笔记")
     async def notes_cmd(self, event: AstrMessageEvent):
-        """看她记了关于你的哪些事，以及上一次她想起了哪几条。"""
-        notes = [n.get("text", "") for n in self.soul.notes[-10:] if n.get("text")]
-        if not notes:
+        """看她记了关于你的哪些事（带 id / 等级 / 是否改过），以及上一次想起了哪几条。"""
+        if not self.soul.notes:
             yield event.plain_result("还没记什么。")
             return
-        out = "关于你：\n" + "\n".join(f"- {x[:40]}" for x in notes)
+        durable = sum(
+            1 for n in self.soul.notes if str(n.get("level") or "") == "非常重要"
+        )
+        out = (
+            f"活跃 {len(self.soul.notes)} 条（非常重要 {durable}，永不淘汰）"
+            f"｜归档 {len(self.soul.archive)} 条\n关于你："
+        )
+        rows = []
+        for n in self.soul.notes[-10:]:
+            ts = float(n.get("ts") or 0)
+            day = time.strftime("%m-%d", time.localtime(ts)) if ts else "--"
+            mark = "·改" if n.get("supersedes") else ""
+            rows.append(
+                f"- [{n.get('id', '')}] {day} {n.get('level') or '普通'}{mark}"
+                f"｜{str(n.get('text') or '')[:40]}"
+            )
+        out += "\n" + "\n".join(rows)
         last = getattr(self.soul, "_last_recall", None)
         if last:
             out += "\n\n上一次她想起的是：\n" + "\n".join(
                 f"- {t}（{s}）" for t, s in last
             )
         yield event.plain_result(out)
+
+    @filter.command("兴趣")
+    async def interests_cmd(self, event: AstrMessageEvent, text: str = ""):
+        """看她现在喜欢/不喜欢什么（带权重和依据）；/兴趣 删 <词> 删一条。"""
+        arg = (text or "").strip()
+        if arg.startswith("删"):
+            key = arg[1:].strip()
+            before = len(self.soul.interests)
+            self.soul.interests = [
+                i
+                for i in self.soul.interests
+                if not (str(i.get("term") or "") == key or key in str(i.get("term") or ""))
+            ]
+            if len(self.soul.interests) == before:
+                yield event.plain_result(f"没找到「{key}」。")
+                return
+            self.soul.save()
+            yield event.plain_result(f"删了「{key}」。")
+            return
+        if not self.soul.interests:
+            yield event.plain_result("还没攒出兴趣。")
+            return
+        rows: list[str] = []
+        for kind in ("喜欢", "不喜欢"):
+            items = self.soul.top_interests(8, kind)
+            if not items:
+                continue
+            rows.append(f"【{kind}】")
+            for it in items:
+                w = self.soul._interest_weight(it)
+                ev = str(it.get("evidence") or "")[:24]
+                rows.append(
+                    f"- {it.get('term')}（{w:.2f}）" + (f"｜依据：{ev}" if ev else "")
+                )
+        rows.append(f"共 {len(self.soul.interests)} 条｜/兴趣 删 <词>")
+        yield event.plain_result("\n".join(rows))
 
     @filter.command("忘掉")
     async def forget_cmd(self, event: AstrMessageEvent, term: str = ""):
@@ -1029,24 +1734,37 @@ class DafeiyuSoul(Star):
 
     @filter.command("心情")
     async def mood_command(self, event: AstrMessageEvent):
-        """看看它现在的心情状态。"""
+        """看看它现在的心情状态（精力/心情都取自 heart 同一套数）。"""
         self.soul.refresh_state()
         self.soul.decay()
         self.soul.save()
         s = self.soul.state
-        label = ""
-        try:
-            hp = Path(r"D:\AstrBot\bot\data\plugin_data\heart\state.json")
-            if hp.exists():
-                label = json.loads(hp.read_text("utf-8")).get("mood") or ""
-        except Exception:  # noqa: BLE001
-            label = ""
-        mood_text = f"{label}（{s['mood']:.2f}）" if label else f"{s['mood']:.2f}"
+        score = _heart_mood()
+        energy = _heart_energy()
+        if energy is None:
+            energy = s["energy"]
+        if score is None:
+            score = s["mood"]
+        idle_h = (time.time() - float(s.get("last_message_ts") or 0)) / 3600.0
+        lt = time.localtime()
+        hour = lt.tm_hour + lt.tm_min / 60.0
+        if _mood is not None:
+            label = _mood.mood_label(score, energy, idle_h, hour)
+            target = _mood.energy_target(hour)
+            sleepy = _mood.is_sleepy(energy, hour)
+        else:
+            label = _heart_mood_label()
+            target, sleepy = energy, energy < 0.22
+        why = _heart_why()
         text = (
             f"好奇 {s['curiosity']:.2f}｜无聊 {s['boredom']:.2f}｜"
-            f"精力 {s['energy']:.2f}｜心情 {mood_text}\n"
-            f"聊过 {s.get('msg_count', 0)} 句，攒了 {len(self.soul.memes)} 个梗、"
-            f"{len(self.soul.notes)} 条记忆"
+            f"精力 {energy:.2f}｜心情 {label}（情绪 {score:.2f}）\n"
+            f"这个时段精力基线 {target:.2f}"
+            + ("，所以她确实该困了" if sleepy else "")
+            + "\n"
+            + (("为什么：" + "；".join(why) + "\n") if why else "")
+            + f"聊过 {s.get('msg_count', 0)} 句，攒了 {len(self.soul.memes)} 个梗、"
+            f"{len(self.soul.notes)} 条记忆、{len(self.soul.interests)} 个兴趣"
         )
         yield event.plain_result(text)
 

@@ -1,0 +1,7 @@
+name: astrbot_plugin_shared_brain
+display_name: 私聊群聊共享记忆
+desc: 私聊与群聊共享近期记忆（含她自己说过的话，3 小时窗口，群聊按群分开记）
+version: 1.1.0
+author: dafeiyu
+repo: https://github.com/
+astrbot_version: ">=4.17.0"
