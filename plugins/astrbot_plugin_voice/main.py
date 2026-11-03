@@ -1083,11 +1083,35 @@ class VoicePlugin(Star):
 
     # ── /嗓子：一眼看出她现在什么心情、会不会出声 ───────────────────
     async def _ping_gsv(self, api_base: str) -> bool:
+        """服务在不在：先试 /docs，不行再退回 TCP 连端口。
+
+        冷启动（要加载 1 分钟模型）时端口还没起来，这里会判成「连不上」；
+        端口一旦 listen 就算在线，不用等 /docs 可访问。
+        """
+        base = api_base.rstrip("/")
         try:
-            timeout = aiohttp.ClientTimeout(total=3)
+            timeout = aiohttp.ClientTimeout(total=5)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(api_base.rstrip("/") + "/docs") as resp:
-                    return resp.status < 500
+                async with session.get(base + "/docs") as resp:
+                    if resp.status < 500:
+                        return True
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from urllib.parse import urlparse
+
+            u = urlparse(base)
+            host = u.hostname or "127.0.0.1"
+            port = u.port or (443 if u.scheme == "https" else 80)
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=3
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            return True
         except Exception:  # noqa: BLE001
             return False
 
@@ -1101,13 +1125,20 @@ class VoicePlugin(Star):
         lines = [
             f"心情：{mood}"
             + (f"（分数 {float(score):.2f}，精力 {float(energy):.2f}）" if score is not None and energy is not None else ""),
-            f"声音：{'会出声，语速 ' + str(policy['speed']) if policy['voice'] else '只打字（这种心情不出声）'}",
+            f"声音：{'自动语音开（语速 ' + str(policy['speed']) + '）' if policy['voice'] else '这种心情不主动发语音（/tts、点她念照样能出声）'}",
             f"后端：{type(engine).__name__}",
         ]
         if isinstance(engine, GSVEngine):
             miss = engine.missing()
             lines.append("配置：" + ("齐了" if not miss else "缺 " + "、".join(miss)))
-            lines.append("服务：" + ("在线" if await self._ping_gsv(engine.api_base) else "连不上（会退回文字）"))
+            lines.append(
+                "服务："
+                + (
+                    "在线"
+                    if await self._ping_gsv(engine.api_base)
+                    else "连不上（刚启动要等约 1 分钟；这期间只发文字）"
+                )
+            )
         last = self._last_voice.get(event.unified_msg_origin)
         if last:
             lines.append(f"上次语音：{int(time.time() - last)} 秒前")
@@ -1215,7 +1246,9 @@ class VoicePlugin(Star):
         if not self._flag("tool", "enable", True):
             return "语音工具被关掉了，用文字回复"
         mood, policy, _ = self._policy()
-        if not policy["voice"]:
+        # 只有「困」「生气」是真的不想出声；平静/无聊/闷闷的只是「不主动说」，
+        # 主人明确点她说话时该出声——不然会出现「让她念一句，她回不想出声」。
+        if mood in ("困", "生气"):
             return f"现在心情是「{mood}」，不想出声，用文字回吧"
         record = await self._record(clean_text(text), event, speed=float(policy.get("speed") or 1.0))
         if record is None:
